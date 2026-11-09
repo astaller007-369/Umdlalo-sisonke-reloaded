@@ -1,0 +1,2919 @@
+"""
+sisonke_app.py
+================
+
+The Streamlit UI for the Sisonke Football Predictive Terminal. All the
+actual math lives in sisonke_engine.py (tested independently - see
+test_engine.py, integration_dry_run.py, and bias_stress_test.py) - this
+file is purely the dashboard wiring: tabs, sidebar, inputs, charts.
+
+RUN:
+    streamlit run sisonke_app.py
+
+HONESTY NOTES:
+- The Gold Mine + League Playstyle panels are general football-reputation
+  starting points, NOT the output of a rigorous statistical backtest of
+  each specific league - see sisonke_engine.py's own notes on these.
+- Tactical multiplier percentages have been reviewed against general
+  football-analytics literature (see apply_tactical_multipliers'
+  docstring for specifics on what was adjusted and why), but several -
+  especially the counter-press style, pitch/weather effects, and referee
+  strictness beyond the one spec'd value - remain reasoned estimates,
+  not values fitted to your own data. They're editable in the sidebar for
+  exactly that reason.
+- This model is built for standard home/away league play (round-robin
+  points tables) - NOT cup/knockout/tournament competitions, which follow
+  different incentive and squad-rotation patterns entirely. Divisions
+  that look like cups (by name) are filtered out of the workspace
+  selector automatically.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import threading
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import sisonke_engine as E
+
+# The app and the engine are two files that must be deployed TOGETHER. If only one was updated the app would crash
+# somewhere deep inside with an AttributeError; say so plainly instead.
+REQUIRED_ENGINE_API_LEVEL = 4
+if getattr(E, "APP_API_LEVEL", 0) < REQUIRED_ENGINE_API_LEVEL:
+    st.error(
+        "⚠️ **sisonke_engine.py is out of date.** This sisonke_app.py needs the matching newer sisonke_engine.py "
+        f"(engine API level {REQUIRED_ENGINE_API_LEVEL} or higher; the file in your repo reports "
+        f"{getattr(E, 'APP_API_LEVEL', 'none - it is an older version')}). Upload BOTH files from the same download, "
+        "commit them, and reboot the app."
+    )
+    st.stop()
+
+N_MARKETS = len(E.MARKET_LIST)  # every on-screen market count comes from here, never a typed-in number
+
+st.set_page_config(page_title="⚽ Sisonke Football Predictive Terminal", page_icon="⚽", layout="wide")
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+DB_FILE = DATA_DIR / "master_sisonke_database.csv"
+LEAGUE_PARAMS_FILE = DATA_DIR / "league_params_cache.json"
+
+
+# ---------------------------------------------------------------------------
+# Per-league parameter cache (disk-persisted) - half-life, rho, territory
+# weights, and the 1X2 calibrators are all backtest-derived and genuinely
+# expensive to recompute (walk_forward_backtest walks every settled match
+# in the division). Without this, Streamlit reruns the ENTIRE script on
+# every single widget interaction - selecting a different fixture, ticking
+# a checkbox, anything - which was re-running that full backtest sweep each
+# time even though nothing about the LEAGUE actually changed. This cache is
+# per-league, keyed by how many settled matches the league had when it was
+# computed: as long as that count hasn't grown (no new results have come
+# in), the cached parameters are reused instantly instead of being refit.
+# Saved to disk (not just st.session_state) so it also survives an app
+# restart, not just staying warm within one running session.
+# ---------------------------------------------------------------------------
+
+def _atomic_write_json(data: dict, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def load_league_params_cache() -> dict:
+    if LEAGUE_PARAMS_FILE.exists():
+        try:
+            return json.loads(LEAGUE_PARAMS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_league_params_cache(cache: dict):
+    _atomic_write_json(cache, LEAGUE_PARAMS_FILE)
+
+
+def get_cached_league_params(division: str, n_settled: int, half_life_frozen: bool) -> dict | None:
+    """Returns the cached param dict for this division ONLY if it was
+    computed at the same settled-match count, in the same half-life
+    mode, as right now - a growing match count means new results have
+    come in since the cache was built, so it's treated as stale rather
+    than silently served."""
+    cache = st.session_state.get("_league_params_disk_cache")
+    if cache is None:
+        cache = load_league_params_cache()
+        st.session_state["_league_params_disk_cache"] = cache
+    entry = cache.get(division)
+    if (
+        entry and entry.get("based_on_n_settled") == n_settled and entry.get("half_life_frozen") == half_life_frozen
+        and entry.get("engine_version") == E.ENGINE_VERSION
+        and entry.get("season_carryover") == round(E.SEASON_CARRYOVER, 3)
+        and entry.get("model_signature") == _model_signature(division)
+    ):
+        return entry
+    return None
+
+
+def set_cached_league_params(division: str, n_settled: int, half_life_frozen: bool, **params):
+    cache = st.session_state.get("_league_params_disk_cache")
+    if cache is None:
+        cache = load_league_params_cache()
+    cache[division] = {
+        "based_on_n_settled": n_settled,
+        "half_life_frozen": half_life_frozen,
+        "engine_version": E.ENGINE_VERSION,
+        "season_carryover": round(E.SEASON_CARRYOVER, 3),
+        "model_signature": _model_signature(division),
+        "computed_at": pd.Timestamp.now().isoformat(),
+        **params,
+    }
+    st.session_state["_league_params_disk_cache"] = cache
+    save_league_params_cache(cache)
+
+
+def get_cached_territory_weights(division: str) -> tuple | None:
+    """Territory weights are a separate, manually-triggered calibration
+    (not tied to settled-match staleness the way half-life/rho/
+    calibrators are) - persisted under their own key so a calibrated
+    weighting survives an app restart instead of living only in
+    st.session_state for the current session."""
+    cache = st.session_state.get("_league_params_disk_cache")
+    if cache is None:
+        cache = load_league_params_cache()
+        st.session_state["_league_params_disk_cache"] = cache
+    weights = cache.get("_territory_weights", {}).get(division)
+    return tuple(weights) if weights else None
+
+
+def set_cached_territory_weights(division: str, weights: tuple):
+    cache = st.session_state.get("_league_params_disk_cache")
+    if cache is None:
+        cache = load_league_params_cache()
+    cache.setdefault("_territory_weights", {})[division] = list(weights)
+    st.session_state["_league_params_disk_cache"] = cache
+    save_league_params_cache(cache)
+
+
+DEFAULT_ENGINE_CFG = {"weights": None, "duel_strength": 1.0, "mismatch_strength": 1.0}
+
+
+def current_territory_weights(division: str) -> tuple:
+    """Session choice first, then the weights saved on disk, then the defaults."""
+    session_weights = st.session_state.get("territory_weights_by_league", {}).get(division)
+    return tuple(session_weights or get_cached_territory_weights(division) or E.TERRITORY_WEIGHTS_DEFAULT)
+
+
+def _model_signature(division: str) -> str:
+    """Fingerprint of every league-specific model setting (territory weights, engine weights, duel strength,
+    mismatch strength). Cached backtest results / calibrators are only reused when it matches exactly, so a
+    setting changed in another session or after a restart can never be served stale numbers."""
+    cfg = current_engine_config(division)
+    return json.dumps({
+        "territory": [round(float(x), 4) for x in current_territory_weights(division)],
+        "engines": {k: round(float(v), 4) for k, v in sorted((cfg["weights"] or {}).items())},
+        "duel": round(float(cfg["duel_strength"]), 3), "mismatch": round(float(cfg["mismatch_strength"]), 3),
+        "scored": backtest_max_evaluated(),  # a different number of scored matches gives different calibrators and badge, so a different cache
+        "rating": E.rating_method_signature(),  # standard and opponent-adjusted ratings must never share a cache
+    }, sort_keys=True)
+
+
+def cached_mismatch_table(division: str) -> dict:
+    """The learned style-vs-style multipliers saved with this league's calibration (empty if none yet)."""
+    cache = st.session_state.get("_league_params_disk_cache")
+    if cache is None:
+        cache = load_league_params_cache()
+        st.session_state["_league_params_disk_cache"] = cache
+    entry = cache.get(division) or {}
+    if entry.get("engine_version") != E.ENGINE_VERSION:
+        return {}
+    return E.deserialize_mismatch_table(entry.get("mismatch_table", {}))
+
+
+def get_cached_engine_config(division: str) -> dict | None:
+    """Per-league tactics config chosen by E.optimize_league_tactics (persisted so it survives restarts):
+    engine weights, duel strength and tactical-mismatch strength."""
+    cache = st.session_state.get("_league_params_disk_cache")
+    if cache is None:
+        cache = load_league_params_cache()
+        st.session_state["_league_params_disk_cache"] = cache
+    raw = cache.get("_engine_weights", {}).get(division)
+    if not raw:
+        return None
+    if not ({"weights", "duel_strength", "mismatch_strength"} & set(raw)):
+        raw = {"weights": dict(raw)}  # older save format: just the engine weights
+    return {**DEFAULT_ENGINE_CFG, **raw}
+
+
+def set_cached_engine_config(division: str, cfg: dict | None):
+    cache = st.session_state.get("_league_params_disk_cache")
+    if cache is None:
+        cache = load_league_params_cache()
+    if cfg:
+        cache.setdefault("_engine_weights", {})[division] = dict(cfg)
+    else:
+        cache.get("_engine_weights", {}).pop(division, None)
+    st.session_state["_league_params_disk_cache"] = cache
+    save_league_params_cache(cache)
+
+
+def current_engine_config(division: str) -> dict:
+    """Session choice first, then disk, then the defaults (automatic weights, full duel + mismatch strength)."""
+    session_choice = st.session_state.get("engine_weights_by_league", {})
+    if division in session_choice:
+        return {**DEFAULT_ENGINE_CFG, **(session_choice[division] or {})}
+    return get_cached_engine_config(division) or dict(DEFAULT_ENGINE_CFG)
+
+
+BACKTEST_CAP_OPTIONS = [300, 600, 1200, 2000, 3000, 5000, "All"]
+
+
+def backtest_max_evaluated():
+    """How many of the most recent matches the backtest scores (None = every eligible match). Every scored match is still predicted
+    from ALL earlier matches; this only limits how many predictions are scored. Set in the sidebar."""
+    choice = st.session_state.get("backtest_cap_choice", E.BACKTEST_MAX_EVALUATED)
+    return None if choice == "All" else int(choice)
+
+
+def current_backtest_kwargs(division: str) -> dict:
+    cfg = current_engine_config(division)
+    # "Frozen 45-day" is the live "Freeze Decay" setting, which weights by match recency rather than calendar days: the backtest must do the same.
+    return dict(engine_weights=cfg["weights"], duel_strength=cfg["duel_strength"], mismatch_strength=cfg["mismatch_strength"],
+                max_evaluated=backtest_max_evaluated(), use_match_index=(st.session_state.get("backtest_hl_choice") == "Frozen 45-day"))
+
+
+@st.cache_resource
+def _shared_compute_store() -> dict:
+    """ONE store for the whole app process, shared by every visitor. (st.session_state is per browser session, so every
+    new visit used to redo each backtest from scratch.) It lives until the app is rebooted; entries are keyed by the
+    league, a fingerprint of the data itself, the model settings and the engine version, so a changed file or a changed
+    setting can never be served a stale result."""
+    return {"lock": threading.Lock(), "wf": {}, "hl": {}, "pm_bt": {}}
+
+
+def _market_bt_key(division: str, settled_div) -> tuple:
+    """Identifies the league + data + every model setting a per-market backtest belongs to, so it is never shown for another league or
+    after a setting changed (the model signature covers territory weights, engine weights, duel/mismatch strength, the matches-scored
+    cap and the rating method)."""
+    return (division, len(settled_div), _data_fingerprint(settled_div), E.ENGINE_VERSION,
+            st.session_state.get("backtest_hl_choice", "Auto-optimised"), _model_signature(division))
+
+
+MARKET_SIGNALS_FILE = DATA_DIR / "market_signals_cache.json"
+
+
+def _per_market_backtest_kwargs(division: str, settled_div):
+    """The exact arguments the Backtester tab's "all markets" run uses, so the result can be found again (instantly, from the cache)
+    from any tab without pressing the button. None while the league's half-life is not known yet."""
+    choice = st.session_state.get("backtest_hl_choice", "Auto-optimised")
+    if choice == "Frozen 45-day":
+        hl = E.FROZEN_HALF_LIFE_DAYS
+    elif choice == "Effectively no decay (raw/unweighted)":
+        hl = 100_000.0
+    else:
+        hl = known_half_life(division, settled_div)
+    if hl is None:
+        return None
+    weights = st.session_state.get("territory_weights_by_league", {}).get(division, E.TERRITORY_WEIGHTS_DEFAULT)
+    return dict(half_life_days=hl, weights=weights, include_all_markets=True, **current_backtest_kwargs(division))
+
+
+def _jsonable_signals(signals: dict) -> dict:
+    return {m: {k: (None if (isinstance(v, float) and v != v) else v) for k, v in s.items()} for m, s in signals.items()}
+
+
+def _remember_market_backtest(division: str, settled_div, df) -> None:
+    """Keep this league's all-markets backtest for EVERY league at once (not just the last one opened), shared by all sessions until
+    the app restarts, and save its reliability statuses to disk so the live sheet can show them even after a restart."""
+    key = _market_bt_key(division, settled_div)
+    store = _shared_compute_store()
+    with store["lock"]:
+        store["pm_bt"][key] = df
+    try:
+        signals = {mode: _jsonable_signals(E.per_market_backtest_accuracy(df, ev_mode=mode)) for mode in ("min", "mean", "max")}
+        disk = json.loads(MARKET_SIGNALS_FILE.read_text()) if MARKET_SIGNALS_FILE.exists() else {}
+        disk[division] = {"key": repr(key), "signals": signals, "saved_at": pd.Timestamp.now().isoformat(timespec="seconds")}
+        _atomic_write_json(disk, MARKET_SIGNALS_FILE)
+    except Exception:
+        pass
+
+
+def _recall_market_backtest(division: str, settled_div):
+    """This league's all-markets backtest if it has been computed under the current data and settings, else None."""
+    key = _market_bt_key(division, settled_div)
+    store = _shared_compute_store()
+    with store["lock"]:
+        df = store["pm_bt"].get(key)
+    if df is not None:
+        return df
+    kw = _per_market_backtest_kwargs(division, settled_div)
+    if kw is not None and wf_is_cached(division, settled_div, **kw):   # computed earlier by the button: fetched instantly, nothing re-run
+        df = cached_walk_forward(division, settled_div, **kw)
+        with store["lock"]:
+            store["pm_bt"][key] = df
+        return df
+    return None
+
+
+def _recall_market_signals(division: str, settled_div, ev_mode: str) -> dict:
+    """{market: reliability verdict} for the live sheet. From the league's backtest when it is in memory, otherwise from the statuses
+    saved on disk for exactly this data and settings. Empty if the league's all-markets backtest has never been run."""
+    key = _market_bt_key(division, settled_div)
+    memo = st.session_state.setdefault("_market_signal_memo", {})
+    if (key, ev_mode) in memo:
+        return memo[(key, ev_mode)]
+    df = _recall_market_backtest(division, settled_div)
+    signals = {}
+    if df is not None and not df.empty:
+        signals = E.per_market_backtest_accuracy(df, ev_mode=ev_mode)
+    else:
+        try:
+            entry = (json.loads(MARKET_SIGNALS_FILE.read_text()) if MARKET_SIGNALS_FILE.exists() else {}).get(division)
+            if entry and entry.get("key") == repr(key):
+                signals = entry["signals"].get(ev_mode, {})
+        except Exception:
+            signals = {}
+    if signals:
+        memo[(key, ev_mode)] = signals
+    return signals
+
+
+def _data_fingerprint(df) -> str:
+    try:
+        return str(int(pd.util.hash_pandas_object(df, index=False).sum()))
+    except Exception:
+        return f"{len(df)}"
+
+
+def _wf_key(division: str, settled_div, kwargs: dict) -> str:
+    return repr((division, len(settled_div), _data_fingerprint(settled_div), E.ENGINE_VERSION, round(E.SEASON_CARRYOVER, 3),
+                 E.rating_method_signature(), sorted((k, repr(v)) for k, v in kwargs.items())))
+
+
+def wf_is_cached(division: str, settled_div, **kwargs) -> bool:
+    return _wf_key(division, settled_div, kwargs) in _shared_compute_store()["wf"]
+
+
+def cached_walk_forward(division: str, settled_div, **kwargs):
+    """A full-model backtest is expensive and Streamlit reruns the whole script on every click, so each distinct backtest is
+    computed once per app process and shared across all sessions. A second session asking for the same one waits for the
+    first to finish instead of repeating the work."""
+    store = _shared_compute_store()
+    key = _wf_key(division, settled_div, kwargs)
+    if key not in store["wf"]:
+        with store["lock"]:
+            if key not in store["wf"]:  # another session may have finished it while we waited for the lock
+                while len(store["wf"]) >= 10:
+                    store["wf"].pop(next(iter(store["wf"])))
+                store["wf"][key] = E.walk_forward_backtest(settled_div, **kwargs)
+    return store["wf"][key]
+
+
+def _hl_key(division: str, settled_div) -> str:
+    return repr((division, len(settled_div), _data_fingerprint(settled_div), E.ENGINE_VERSION, round(E.SEASON_CARRYOVER, 3)))
+
+
+def hl_cached_value(division: str, settled_div):
+    """The cached (best_half_life, info) for this league, or None if it has not been searched yet."""
+    return _shared_compute_store()["hl"].get(_hl_key(division, settled_div))
+
+
+def known_half_life(division: str, settled_div):
+    """This league's half-life if it is ALREADY known - from the shared cache, or from the saved calibration on disk that the
+    Projections tab uses - without running the search. None means it genuinely has not been searched yet."""
+    shared = hl_cached_value(division, settled_div)
+    if shared:
+        return shared[0]
+    saved = get_cached_league_params(division, len(settled_div), half_life_frozen=False)
+    if saved and saved.get("half_life_days") is not None:
+        return saved["half_life_days"]
+    return None
+
+
+def cached_half_life(division: str, settled_div):
+    store = _shared_compute_store()
+    key = _hl_key(division, settled_div)
+    if key not in store["hl"]:
+        with store["lock"]:
+            if key not in store["hl"]:
+                store["hl"][key] = E.optimize_half_life(settled_div)
+    return store["hl"][key]
+
+
+def apply_uploaded_odds(prices: dict, meta: dict):
+    """on_click callback: put uploaded prices into the odds boxes. Runs BEFORE the page is redrawn, so the boxes pick the
+    new values up (setting a box's value after it has been drawn is not allowed)."""
+    st.session_state["odds_upload_meta"] = {**meta, "markets": sorted(prices), "applied": {m: float(v) for m, v in prices.items()}}
+    for market, value in prices.items():
+        st.session_state[f"odds_{market}"] = float(value)
+    updated = dict(st.session_state.get("bookmaker_odds", {}))
+    updated.update({m: float(v) for m, v in prices.items()})
+    st.session_state.bookmaker_odds = updated
+
+
+def clear_uploaded_odds():
+    meta = st.session_state.pop("odds_upload_meta", None) or {}
+    updated = dict(st.session_state.get("bookmaker_odds", {}))
+    for market in meta.get("markets", []):
+        st.session_state[f"odds_{market}"] = 2.00
+        updated[market] = 2.00
+    st.session_state.bookmaker_odds = updated
+
+
+def run_tactics_optimisation(division: str, settled_div, half_life: float, territory_weights: tuple):
+    """Tunes engine weights + duel strength + tactical-mismatch strength for this league with the territory
+    weights given, stores the result (disk + session), and flags a recalibration. Used by the manual button AND
+    automatically right after territory weights change, because every score in the search depends on them."""
+    with st.spinner(f"Tuning engine weights, duel strength and tactical mismatch for {division} against the current territory weights (about 1-3 minutes)..."):
+        cfg, info = E.optimize_league_tactics(settled_div, half_life, territory_weights)
+    st.session_state.setdefault("engine_weights_by_league", {})[division] = cfg
+    set_cached_engine_config(division, cfg)
+    st.session_state.setdefault("_engine_weight_report", {})[division] = info
+    st.session_state["_force_recalibrate_flag"] = True
+
+
+# ---------------------------------------------------------------------------
+# Season standings archive (disk-persisted) - snapshots the CURRENT real
+# standings table (E.compute_standings_table) for a division under a
+# user-given season label, so a league's final table stays retrievable
+# even after new-season matches start accumulating in the same underlying
+# dataset. This dataset has no explicit season_id column, so "starting a
+# new season" here means: archive the current final table BEFORE the new
+# season's results get appended - the archive itself is what "resets" the
+# view for the new season (last season's standings live in the archive,
+# not mixed into whatever table gets computed from the growing dataset).
+# ---------------------------------------------------------------------------
+
+SEASON_ARCHIVE_FILE = DATA_DIR / "season_archive.json"
+
+
+def load_season_archive() -> dict:
+    if SEASON_ARCHIVE_FILE.exists():
+        try:
+            return json.loads(SEASON_ARCHIVE_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_season_archive(archive: dict):
+    _atomic_write_json(archive, SEASON_ARCHIVE_FILE)
+
+
+def archive_standings_snapshot(division: str, season_label: str, standings_df: pd.DataFrame, settled_div: pd.DataFrame):
+    archive = load_season_archive()
+    archive.setdefault(division, {})[season_label] = {
+        "archived_at": pd.Timestamp.now().isoformat(),
+        "n_matches": int(len(settled_div)),
+        "date_from": str(settled_div["date"].min().date()) if settled_div["date"].notna().any() else None,
+        "date_to": str(settled_div["date"].max().date()) if settled_div["date"].notna().any() else None,
+        "standings": standings_df.to_dict(orient="records"),
+    }
+    save_season_archive(archive)
+
+
+def list_archived_seasons(division: str) -> dict:
+    return load_season_archive().get(division, {})
+
+
+def delete_archived_season(division: str, season_label: str):
+    archive = load_season_archive()
+    if division in archive:
+        archive[division].pop(season_label, None)
+        save_season_archive(archive)
+
+
+# ---------------------------------------------------------------------------
+# Local storage (Section 1 upload port + requested download/clear controls)
+# ---------------------------------------------------------------------------
+def _atomic_write_csv(df: pd.DataFrame, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+    tmp.replace(path)
+
+
+def load_database_from_disk():
+    if DB_FILE.exists():
+        try:
+            return E.standardise_columns(pd.read_csv(DB_FILE, dtype=str))
+        except Exception:
+            return None
+    return None
+
+
+def save_database_to_disk(df: pd.DataFrame):
+    _atomic_write_csv(df, DB_FILE)
+
+
+def prepare_raw_upload(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Standardises columns AND normalises team-name casing so 'Chelsea'
+    and 'chelsea' resolve to one team, right at load time - before
+    anything else touches the data."""
+    df = E.standardise_columns(raw_df)
+    df = E.normalize_name_casing(df, ["home_team", "away_team"])
+    return df
+
+
+def coerce_working_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
+    df = prepare_raw_upload(raw_df)
+    numeric_cols = [
+        "home_goals", "away_goals",
+        "home_shots_on_target", "away_shots_on_target",
+        "home_big_chances", "away_big_chances",
+        "home_box_touches", "away_box_touches",
+        # Auxiliary engines (set-piece / transition / duel-resilience / goalkeeping) -
+        # optional columns; coerce_numeric() is a no-op for any that aren't present
+        # in this particular upload, so older datasets without them still work fine.
+        "home_corner_kicks", "away_corner_kicks",
+        "home_fouled_in_final_third", "away_fouled_in_final_third",
+        "home_accurate_crosses", "away_accurate_crosses",
+        "home_accurate_long_passes", "away_accurate_long_passes",  # long passes VOLUME
+        "home_final_third_entries", "away_final_third_entries",
+        "home_dribbles_percentage", "away_dribbles_percentage",
+        "home_successful_crosses_percentage", "away_successful_crosses_percentage",
+        "home_successful_long_passes_percentage", "away_successful_long_passes_percentage",  # long passes ACCURACY - same action as accurate_long_passes above, just the %-completed version
+        "home_tackles_won_percentage", "away_tackles_won_percentage",
+        "home_ground_duels_percentage", "away_ground_duels_percentage",
+        "home_aerial_duels_percentage", "away_aerial_duels_percentage",
+        "home_goalkeeper_saves", "away_goalkeeper_saves",
+        # Provider-tracked expected goals - a direct shot-quality measurement,
+        # not the territorial engine's own proxy. Optional, same graceful
+        # fallback as everything else above.
+        "home_xg", "away_xg",
+        "home_xgot", "away_xgot",
+        "home_xg_set_play", "away_xg_set_play",
+        "home_xg_open_play", "away_xg_open_play",
+    ]
+    df = E.coerce_numeric(df, numeric_cols)
+    had_date_column = E.find_date_column(df) is not None or "date" in df.columns
+    df = E.parse_dates(df, "date")
+    dropped_bad_dates = 0
+    if had_date_column and "date" in df.columns and df["date"].notna().any():
+        unplayed_mask = df.apply(lambda r: E.is_unplayed(r.get("home_goals"), r.get("away_goals")), axis=1)
+        bad = df["date"].isna() & ~unplayed_mask
+        dropped_bad_dates = int(bad.sum())
+        if dropped_bad_dates:
+            df = df.loc[~bad].copy()  # a played match with no readable date can't be placed in time
+    df.attrs["had_date_column"] = had_date_column
+    df.attrs["dropped_bad_dates"] = dropped_bad_dates
+    return df
+
+
+if "raw_db" not in st.session_state:
+    st.session_state.raw_db = load_database_from_disk()
+if "bookmaker_odds" not in st.session_state:
+    st.session_state.bookmaker_odds = {m: 2.00 for m in E.MARKET_LIST}
+if "title_odds" not in st.session_state:
+    st.session_state.title_odds = {}
+if "multi_bet_slip" not in st.session_state:
+    st.session_state.multi_bet_slip = []  # list of dicts - persists across different fixtures/leagues
+
+
+def find_division_series(df: pd.DataFrame):
+    col = E.find_division_column(df)
+    if col is None:
+        return None, None, None
+    all_divisions = sorted(df[col].dropna().unique().tolist())
+    standard, excluded = E.filter_to_standard_leagues(all_divisions)
+    return col, standard, excluded
+
+
+# ---------------------------------------------------------------------------
+# Sidebar (Section 1 + local storage controls)
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚽ Sisonke Control Deck")
+    active_tab = st.radio(
+        "Active workspace",
+        ["📁 Research & Sentiment Tracker", "📊 Active Projections Matrix"],
+        key="active_workspace",
+    )
+    st.select_slider(
+        "🔬 Backtest: matches scored", options=BACKTEST_CAP_OPTIONS, value=E.BACKTEST_MAX_EVALUATED, key="backtest_cap_choice",
+        format_func=lambda o: "All" if o == "All" else f"{o:,}",
+        help="How many of the most recent matches the backtest scores. Every scored match is still predicted from ALL earlier matches (the "
+             "history is never cut). More scored matches give more calls per market and steadier verdicts, accuracy and calibration, but the "
+             "backtest takes longer, and the earliest scored matches have the thinnest history. 'All' scores every match with enough earlier "
+             "history. Changing this rebuilds the backtest and the league calibration, which takes a few minutes the first time.",
+    )
+    st.selectbox(
+        "🧮 Rating method", ["Standard", "Opponent-adjusted (smoothed)"], key="rating_method_choice",
+        help="Standard: each team's own recency-weighted average of its territorial stats, with a hard cut-off under 5 matches. "
+             "Opponent-adjusted: ratings are fitted jointly over all matches so the strength of opponents is taken into account, and thin "
+             "samples are pulled toward the league average smoothly instead of switching on at 5 matches. Compare the two on a league in "
+             "the Backtester tab before relying on it. Changing this rebuilds the backtest and the league calibration.",
+    )
+    if st.session_state.get("rating_method_choice") == "Opponent-adjusted (smoothed)":
+        with st.expander("Smoothing strength"):
+            st.number_input("Pseudo-matches pulling each team toward league average", 0.0, 40.0, 6.0, 1.0, key="opp_shrink_k",
+                            help="Higher = more cautious with thin samples. 6 means a team with about 6 matches' worth of weight is half-trusted.")
+            st.number_input("Pseudo-matches pulling home/away form toward overall form", 0.0, 60.0, 8.0, 1.0, key="opp_venue_k",
+                            help="Higher = home and away ratings stay closer to the team's overall rating.")
+    E.set_opponent_adjustment(st.session_state.get("rating_method_choice") == "Opponent-adjusted (smoothed)",
+                              float(st.session_state.get("opp_shrink_k", 6.0)), float(st.session_state.get("opp_venue_k", 8.0)))
+
+    st.divider()
+    st.subheader("📤 Historical Matchday Upload")
+    st.caption(
+        "Upload one league's CSV at a time - each upload adds/updates just that league "
+        "and leaves every other previously loaded league untouched. Re-uploading a file "
+        "for a league you've already loaded replaces its old rows with the new ones "
+        "(no duplicates); a genuinely new league is simply added alongside the rest."
+    )
+    uploaded = st.file_uploader("Upload a league's database (.csv)", type=["csv"], key="db_uploader")
+    if uploaded is not None:
+        try:
+            new_raw = pd.read_csv(uploaded, dtype=str)
+            new_raw, schema_report = E.prepare_upload(new_raw)
+            new_raw = E.normalize_name_casing(new_raw, ["home_team", "away_team"])
+            for msg in schema_report.fixes:
+                st.info(f"🔧 Auto-fixed: {msg}")
+            for msg in schema_report.warnings:
+                st.warning(f"⚠️ {msg}")
+            for msg in schema_report.info:
+                st.caption(f"ℹ️ {msg}")
+            if not schema_report.ok:
+                for msg in schema_report.errors:
+                    st.error(f"🚫 {msg}")
+                raise ValueError("schema check failed - nothing was saved")
+
+            if st.session_state.raw_db is None:
+                merged = new_raw
+                merge_note = f"✅ First upload - {len(new_raw)} row(s) loaded."
+            else:
+                new_div_col = E.find_division_column(new_raw)
+                if new_div_col is None:
+                    merged = pd.concat([st.session_state.raw_db, new_raw], ignore_index=True)
+                    merge_note = (
+                        f"⚠️ Couldn't find a division column in this file, so its {len(new_raw)} "
+                        "row(s) were appended rather than replacing a specific league - if this is "
+                        "an updated file for a league you already loaded, clear that league first "
+                        "(below) to avoid duplicate rows."
+                    )
+                else:
+                    new_divisions = new_raw[new_div_col].dropna().unique().tolist()
+                    existing_div_col = E.find_division_column(st.session_state.raw_db)
+                    if existing_div_col:
+                        kept = st.session_state.raw_db[~st.session_state.raw_db[existing_div_col].isin(new_divisions)]
+                    else:
+                        kept = st.session_state.raw_db
+                    merged = pd.concat([kept, new_raw], ignore_index=True)
+                    shown_divs = ", ".join(str(d) for d in new_divisions[:3]) + ("..." if len(new_divisions) > 3 else "")
+                    merge_note = (
+                        f"✅ Added/updated {len(new_divisions)} league(s) ({shown_divs}) - "
+                        f"{len(new_raw)} row(s). All other previously loaded leagues were kept "
+                        f"untouched ({len(kept)} existing row(s) preserved)."
+                    )
+
+            st.session_state.raw_db = merged
+            save_database_to_disk(merged)
+            st.success(merge_note)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Couldn't read that file: {exc}")
+
+    if st.session_state.raw_db is not None:
+        st.caption(f"💾 Database loaded: {len(st.session_state.raw_db)} row(s).")
+
+        st.download_button(
+            "⬇️ Download current database (.csv)",
+            data=st.session_state.raw_db.to_csv(index=False).encode("utf-8"),
+            file_name="master_sisonke_database.csv",
+            mime="text/csv",
+            key="db_download_btn",
+        )
+
+        with st.expander("🧹 Clear data"):
+            _dcol, _divs, _ = find_division_series(st.session_state.raw_db)
+            if _dcol:
+                clear_division = st.selectbox("League to clear", ["(pick one)"] + _divs, key="clear_division_pick")
+                if st.button("Clear this league only", key="clear_one_league"):
+                    if clear_division != "(pick one)":
+                        remaining = st.session_state.raw_db[st.session_state.raw_db[_dcol] != clear_division]
+                        st.session_state.raw_db = remaining
+                        save_database_to_disk(remaining)
+                        st.success(f"Cleared '{clear_division}'.")
+                        st.rerun()
+            confirm_wipe = st.checkbox("I understand this deletes the ENTIRE database", key="confirm_wipe_db")
+            if st.button("🗑️ Clear ALL data", disabled=not confirm_wipe, key="clear_all_db"):
+                st.session_state.raw_db = None
+                if DB_FILE.exists():
+                    DB_FILE.unlink()
+                st.success("Database cleared.")
+                st.rerun()
+    else:
+        st.caption("No database loaded yet.")
+
+    st.divider()
+    with st.expander("📱 Telegram Notifications"):
+        st.caption("Sends the current prediction on demand - never runs automatically, and is the only part of this app that needs internet access.")
+        tg_token = st.text_input("Bot Token", type="password", key="tg_token")
+        tg_chat_id = st.text_input("Chat ID", key="tg_chat_id")
+        # NOTE: st.text_input(..., key="tg_token") already writes its value
+        # into st.session_state["tg_token"] automatically - Streamlit
+        # forbids writing to that same key again by hand once the widget
+        # has run this turn (raises StreamlitWidgetAlreadyInstantiatedError).
+        # The local variables tg_token/tg_chat_id above already hold the
+        # current values if this expander needs them directly.
+
+
+if st.session_state.raw_db is None:
+    st.title("⚽ SISONKE FOOTBALL HUB")
+    st.info("👋 Upload your historical matchday database in the sidebar to get started.")
+    st.stop()
+
+working_df = coerce_working_frame(st.session_state.raw_db)
+division_col, divisions, excluded_divisions = find_division_series(working_df)
+
+if division_col is None:
+    st.error(
+        "⚠️ Couldn't find a division column - your CSV needs one named "
+        "`league_country`, `league`, or `competition`."
+    )
+    st.stop()
+
+if not divisions:
+    st.error("⚠️ Every division in this file looks like a cup/tournament competition - this model is built strictly for standard league play.")
+    st.stop()
+
+if excluded_divisions:
+    st.sidebar.caption(
+        f"🚫 {len(excluded_divisions)} cup/tournament competition(s) hidden "
+        f"(this model is for standard league play only): {', '.join(excluded_divisions[:3])}"
+        + ("..." if len(excluded_divisions) > 3 else "")
+    )
+
+if working_df.attrs.get("dropped_bad_dates", 0):
+    st.warning(
+        f"📅 {working_df.attrs['dropped_bad_dates']} played match(es) had an unreadable or blank date and were "
+        "left out of the model (they cannot be placed in time, and would otherwise be mistaken for the most "
+        "recent matches). Fix those dates in the CSV and re-upload to include them."
+    )
+
+if not working_df.attrs.get("had_date_column", True):
+    st.warning(
+        "📅 No date column was found in your CSV (checked for `date`, `match_date`, "
+        "`fixture_date`, `kickoff`, and a few other common names). Everything will "
+        "still run, but time-decay weighting, the backtest, and fixture dates in the "
+        "Sentiment Tracker will all be blind to recency until you add one - add a "
+        "column with one of those names and re-upload."
+    )
+
+
+def league_profile_banner(division: str):
+    hint = E.gold_mine_hint(division)
+    style = E.league_playstyle_profile(division)
+    st.info(f"💡 **{hint}**")
+    st.caption(f"🎨 League profile: {style}")
+
+
+# ---------------------------------------------------------------------------
+# Section 2: Research & Sentiment Tracker (offline tab)
+# ---------------------------------------------------------------------------
+def render_sentiment_tracker():
+    st.title("📁 Research & Sentiment Tracker")
+    st.caption("🔒 An isolated, offline screening workspace - nothing here blocks the main analytics hub downstream.")
+
+    division = st.selectbox("🏆 League workspace", divisions, key="sentiment_division")
+    league_profile_banner(division)
+    division_df = working_df[working_df[division_col] == division]
+    settled_div, upcoming_div = E.split_played_unplayed(division_df)
+
+    if upcoming_div.empty:
+        st.warning("No unplayed fixtures detected for this division (no blank/comma goal cells found).")
+        return
+
+    fixture_labels = [
+        f"{r.home_team} vs {r.away_team}"
+        + (f" ({r.date.date()})" if pd.notna(getattr(r, "date", None)) else "")
+        for r in upcoming_div.itertuples()
+    ]
+    fixture_choice = st.selectbox("🎯 Select Target Upcoming Fixture", fixture_labels, key="sentiment_fixture")
+
+    st.subheader("📋 The 7-Day Diary Checklist")
+    c1, c2, c3, c4 = st.columns(4)
+    d7 = c1.checkbox("📅 7 Days Out - initial team news scanned", key="diary_7d")
+    d72 = c2.checkbox("🕐 72 Hours Out - press conference checked", key="diary_72h")
+    d24 = c3.checkbox("⏰ 24 Hours Out - confirmed absentees noted", key="diary_24h")
+    d60 = c4.checkbox("⏱️ 60 Mins Out - final lineup confirmed", key="diary_60m")
+    ticked = sum([d7, d72, d24, d60])
+
+    st.subheader("🎭 Sentiment")
+    sentiment = st.selectbox(
+        "Current season motivation", ["🏖️ Beach Mode", "📉 Relegation Battle", "📈 Promotion Race", "🔥 Derby"],
+        key="sentiment_choice",
+    )
+
+    confidence = round((ticked / 4) * 10)
+    st.subheader("🎯 Confidence Rating")
+    st.metric("Confidence Score (out of 10)", confidence)
+    if confidence <= 3:
+        st.error("🔴 PASS / NO BET - insufficient information gathered for this fixture.")
+    else:
+        st.success(f"🟢 Sufficient research depth logged ({ticked}/4 checklist items).")
+    st.caption("ℹ️ This rating is advisory only - it never locks or breaks the Active Projections Matrix downstream, even at a PASS rating.")
+
+
+# ---------------------------------------------------------------------------
+# Active Projections Matrix tab (the main calculator)
+# ---------------------------------------------------------------------------
+def render_projections_matrix():
+    division = st.selectbox("🏆 League workspace", divisions, key="matrix_division")
+    league_profile_banner(division)
+    division_df = working_df[working_df[division_col] == division]
+    settled_div, upcoming_div = E.split_played_unplayed(division_df)
+
+    season_carryover = st.slider(
+        "🗓️ Season carry-over weight (league baseline)", 0.0, 1.0, float(E.SEASON_CARRYOVER), 0.05, key="season_carryover_slider",
+        help="League averages (goals, shots, big chances...) are season-aware: the current season counts fully, each "
+             "earlier season counts this fraction of the one after it. 0 = current season only, 1 = pool every season "
+             "equally (the old behaviour). Early in a new season the previous seasons still dominate automatically, "
+             "because the new season has few matches yet.",
+    )
+    E.set_season_carryover(season_carryover)
+
+    # One shared disk-cache lookup for everything backtest-derived for this
+    # league (half-life search, rho, reliability BSS, 1X2 calibrators) -
+    # keyed on settled-match count + half-life mode, so it's reused across
+    # every fixture click / checkbox toggle within the SAME league state,
+    # and only invalidated when new results actually arrive or the user
+    # explicitly hits "Recalibrate now" / recalibrates territory weights.
+    n_settled = len(settled_div)
+    force_recalibrate = st.session_state.pop("_force_recalibrate_flag", False)
+    early_freeze_decay = st.session_state.get("freeze_decay", False)
+    cached_params = None if force_recalibrate else get_cached_league_params(division, n_settled, half_life_frozen=early_freeze_decay)
+
+    if upcoming_div.empty:
+        st.warning("⚠️ No unplayed fixtures detected for this division.")
+        return
+    if len(settled_div) < E.MIN_SAMPLE_ROWS:
+        st.warning(
+            f"⚠️ Only {len(settled_div)} settled match(es) in this division - below the "
+            f"{E.MIN_SAMPLE_ROWS}-match safety rail. Calculations will fall back to "
+            "neutral baselines wherever a team's own sample is too small."
+        )
+
+    fixture_labels = [f"{r.home_team} vs {r.away_team}" for r in upcoming_div.itertuples()]
+    fixture_choice = st.selectbox("🎯 Select fixture to project", fixture_labels, key="matrix_fixture")
+    home_team, away_team = fixture_choice.split(" vs ")
+
+    # The selected fixture's OWN scheduled date - needed for fixture-congestion
+    # (below) to count each team's recent matches relative to when THIS game is
+    # actually played, not just the latest settled-match date used for decay
+    # weighting elsewhere. Falls back to "now" if the upcoming fixture has no
+    # date at all.
+    _selected_fixture_rows = upcoming_div[
+        (upcoming_div["home_team"] == home_team) & (upcoming_div["away_team"] == away_team)
+    ]
+    if not _selected_fixture_rows.empty and _selected_fixture_rows["date"].notna().any():
+        fixture_date = _selected_fixture_rows["date"].iloc[0]
+    else:
+        fixture_date = pd.Timestamp.now()
+
+    # --- Core Parameter A: time decay ---
+    st.subheader("⏳ Time-Decay Half-Life")
+    st.caption(f"Automatically calibrated by default (Brier-score backtest across {min(E.HALF_LIFE_CANDIDATES)}-{E.HALF_LIFE_MAX_DAYS} days) - this is the main calibrator and should be left alone for normal use.")
+    freeze_decay = st.checkbox(
+        "🧊 Freeze Decay (special cases only - e.g. right after a summer break or international window)",
+        key="freeze_decay",
+    )
+    if freeze_decay:
+        half_life = E.FROZEN_HALF_LIFE_DAYS
+        use_match_index = True
+        st.caption(
+            f"Frozen at {half_life} calendar days - BUT weighting is based on **match recency, not calendar "
+            "days elapsed**, specifically so a summer break or international window doesn't fictitiously flatten "
+            "a team's recent form just because a lot of calendar time happened to pass. A team's actual last "
+            f"{E.FROZEN_HALF_LIFE_MATCHES:.0f} matches still carry the normal weight regardless of the gap."
+        )
+    else:
+        use_match_index = False
+        if cached_params:
+            half_life = cached_params["half_life_days"]
+            st.caption(
+                f"📦 Using cached optimal half-life: **{half_life} days** (from a backtest run "
+                f"when this league had {n_settled} settled matches)."
+            )
+        else:
+            with st.spinner("Backtesting half-life candidates against real results..."):
+                half_life, hl_info = cached_half_life(division, settled_div)
+            st.caption(f"⚙️ Optimal half-life selected via Brier-score backtest: **{half_life} days**.")
+        boundary_warning = E.half_life_at_search_boundary(half_life)
+        if boundary_warning:
+            st.warning(boundary_warning)
+            dilution_cache_key = (division, len(settled_div))
+            if st.session_state.get("_dilution_cache_key") != dilution_cache_key:
+                with st.spinner("Checking how much of the search window is diluted by thin per-team-venue samples..."):
+                    dilution_report = E.safety_rail_dilution_report(settled_div)
+                st.session_state["_dilution_cache_key"] = dilution_cache_key
+                st.session_state["_dilution_report_cached"] = dilution_report
+            else:
+                dilution_report = st.session_state["_dilution_report_cached"]
+
+            if dilution_report.get("total_evaluated", 0) > 0:
+                st.caption(
+                    f"🔬 Dilution check: of the {dilution_report['total_evaluated']} matches this "
+                    f"search actually evaluated, **{dilution_report['diluted_count']} "
+                    f"({dilution_report['diluted_pct']}%)** had at least one side under the 5-match "
+                    "safety rail at that point in time - contributing a flat neutral value instead "
+                    "of real signal, regardless of which half-life was being tested. A high "
+                    "percentage here is a real, concrete explanation for a boundary result; a low "
+                    "one means something else is driving it (genuinely longer/shorter true memory "
+                    "for this league, or a data quality issue worth checking)."
+                )
+            else:
+                st.caption(f"🔬 Dilution check: {dilution_report.get('reason', 'not enough data to check')}.")
+
+            if half_life >= E.HALF_LIFE_MAX_DAYS:
+                st.caption(
+                    f"The search already runs all the way to {E.HALF_LIFE_MAX_DAYS} days (one year), so there is no longer "
+                    "a hidden ceiling to test beyond it. A league that lands here has results that stay informative for "
+                    "about a full year - a very long memory. Check the dilution figure above before trusting it."
+                )
+
+    reference_date = settled_div["date"].max() if settled_div["date"].notna().any() else pd.Timestamp.now()
+
+    # --- Core Parameter B: volatility ---
+    st.subheader("🎛️ Volatility Auto-Calibrator")
+    vol_profile = E.compute_volatility_profile(settled_div)
+    vc1, vc2, vc3 = st.columns(3)
+    vc1.metric("📊 Dispersion Ratio", f"{vol_profile.dispersion_ratio:.3f}")
+    vc2.metric("🔄 Squad Turnover Index", f"{vol_profile.squad_turnover_index:.3f}")
+    vc3.metric("🌡️ Volatility Dampener", f"{vol_profile.vol_dampener:.3f}" + (" (adjusted)" if vol_profile.adjusted else ""))
+
+    # --- Territory weight calibration + model reliability badge ---
+    if "territory_weights_by_league" not in st.session_state:
+        # Seed from disk on first touch this session, so a weighting
+        # calibrated in a PREVIOUS session/app run is still honoured
+        # rather than silently reverting to equal weights.
+        st.session_state.territory_weights_by_league = {}
+    disk_weights = get_cached_territory_weights(division)
+    territory_weights = st.session_state.territory_weights_by_league.get(
+        division, disk_weights or E.TERRITORY_WEIGHTS_DEFAULT
+    )
+    if "engine_weights_by_league" not in st.session_state:
+        st.session_state.engine_weights_by_league = {}
+    engine_cfg = current_engine_config(division)
+    engine_weights = engine_cfg["weights"]  # None = automatic (reliability-weighted) blend
+    duel_strength = engine_cfg["duel_strength"]
+    mismatch_strength = engine_cfg["mismatch_strength"]
+
+    # Everything below (rho for TODAY's live prediction, the reliability
+    # BSS badge, and the full all-market calibrators) is derived from ONE
+    # walk-forward backtest sweep over this league - reusing the SAME
+    # cache lookup from the top of this function (n_settled / half-life-
+    # mode keyed), so a cache hit there means a cache hit here too, with
+    # no second disk read needed.
+    if cached_params and "market_calibrators" in cached_params and "market_calibrators_mc" in cached_params:
+        rho = cached_params["rho"]
+        badge_bss = cached_params["badge_bss"]
+        market_calibrators = E.deserialize_all_market_calibrators(cached_params["market_calibrators"])
+        market_calibrators_mc = E.deserialize_all_market_calibrators(cached_params["market_calibrators_mc"])
+        mismatch_table = E.deserialize_mismatch_table(cached_params.get("mismatch_table", {}))
+        reliability_score = E.LeagueReliabilityScore(**cached_params["reliability_score"])
+        cache_status_note = (
+            f"📦 Using cached calibration for this league (computed {cached_params.get('computed_at', 'unknown')}, "
+            f"{n_settled} settled matches)."
+        )
+    else:
+        with st.spinner(f"Running the walk-forward backtest for {division} (rho, reliability, and calibration for all {N_MARKETS} markets)..."):
+            # include_all_markets=True: this backtest's core Home/Draw/Away probabilities
+            # now fit rho and build the real Dixon-Coles-adjusted grid at every historical
+            # step (see walk_forward_backtest's docstring) - the same computation live
+            # prediction uses, not an approximation of it - and additionally stores every
+            # other market's own probability + ground truth, which full-market calibration
+            # fitting needs. This makes a cache MISS noticeably more expensive than before;
+            # the disk cache above is what keeps that cost paid once per league state
+            # rather than on every fixture click.
+            badge_backtest_df = E.walk_forward_backtest(
+                settled_div, half_life_days=half_life, weights=territory_weights, include_all_markets=True,
+                engine_weights=engine_weights, duel_strength=duel_strength, mismatch_strength=mismatch_strength,
+                max_evaluated=backtest_max_evaluated(), use_match_index=use_match_index,
+            )
+            mismatch_table = E.compute_mismatch_table(badge_backtest_df)
+            badge_bss = E.brier_skill_score(badge_backtest_df) if not badge_backtest_df.empty else float("nan")
+            rho = E.fit_rho(settled_div)
+            market_calibrators = E.fit_all_market_calibrators(badge_backtest_df) if not badge_backtest_df.empty else {}
+            # Monte Carlo has a different (jittered) distribution from Dixon-Coles, so it is backtested and
+            # calibrated on its OWN output rather than borrowing the Dixon-Coles calibrators.
+            market_calibrators_mc = E.fit_all_market_calibrators(badge_backtest_df, prob_prefix="mcprob") if not badge_backtest_df.empty else {}
+            # Continuous reliability score reuses this SAME backtest_df (no extra backtest
+            # run needed) - see compute_league_reliability_score() for what it combines.
+            reliability_score = E.compute_league_reliability_score(settled_div, badge_backtest_df, territory_weights)
+        set_cached_league_params(
+            division, n_settled, half_life_frozen=freeze_decay,
+            half_life_days=half_life, rho=rho, badge_bss=badge_bss,
+            market_calibrators=E.serialize_all_market_calibrators(market_calibrators),
+            market_calibrators_mc=E.serialize_all_market_calibrators(market_calibrators_mc),
+            mismatch_table=E.serialize_mismatch_table(mismatch_table),
+            reliability_score=vars(reliability_score),
+        )
+        cache_status_note = f"🆕 Freshly computed and cached for next time ({n_settled} settled matches)."
+
+    st.subheader("🩺 Model Reliability for This League")
+    badge_emoji, badge_label = E.league_reliability_badge(badge_bss)
+    rel_col1, rel_col2 = st.columns([1, 3])
+    rel_col1.metric("Status", f"{badge_emoji} {badge_label}")
+    bss_display = f"{badge_bss:.3f}" if not math.isnan(badge_bss) else "n/a"
+    rel_col2.caption(
+        f"Brier Skill Score: **{bss_display}** (0 = no better than guessing this league's own "
+        "historical outcome split; positive = genuinely beats it; negative = worse than it). "
+        "See the Performance Backtester tab for the full walk-forward detail."
+    )
+    with st.expander(f"🧮 Continuous xG-Proxy Reliability Score: {reliability_score.composite_score:.2f} / 1.00"):
+        st.caption(
+            "A single 0-1 score for how much THIS league's results and territorial/xG-proxy numbers can be "
+            "trusted, built entirely from this league's own data - replaces a hand-curated "
+            "'good league / bad league' list with something computed directly, and updates "
+            "automatically as more results come in."
+        )
+        rs1, rs2, rs3 = st.columns(3)
+        bss_for_score = f"{reliability_score.bss:.3f}" if not math.isnan(reliability_score.bss) else "n/a"
+        rs1.metric("Brier Skill Score", bss_for_score)
+        xg_corr_display = f"{reliability_score.xg_proxy_correlation:.2f}" if not math.isnan(reliability_score.xg_proxy_correlation) else "n/a"
+        rs2.metric("xG-proxy ↔ goal-diff correlation", xg_corr_display, help="Pearson r between the territorial differential and actual goal difference - does dominance here actually convert to goals?")
+        rs3.metric("Dispersion index", f"{reliability_score.dispersion_index:.2f}", help="1.00 = perfectly Poisson-behaved scorelines. Further from 1.00 = more chaotic/harder to model.")
+        st.caption(
+            "ℹ️ This one score is built from results and territorial/xG-proxy numbers (goals, big chances, shots on "
+            "target, box touches): the Brier Skill Score, how well the territorial edge tracks goal difference, and "
+            "how Poisson-like the goal counts are. It is not the whole model - the model already handles the rest "
+            "separately: set-piece share (set-piece and xG set-play engines, each with its own reliability score), "
+            "direct/transition style (transition engine), fixture congestion (worked out automatically for each "
+            "fixture from the matches in your file, so league games only) and referee tendency (the Referee "
+            "Strictness setting further down)."
+        )
+    cache_col1, cache_col2 = st.columns([3, 1])
+    cache_col1.caption(cache_status_note)
+    if cache_col2.button("🔄 Recalibrate now", key="recalibrate_league_btn", help="Ignore the cache and force a fresh backtest for this league right now."):
+        st.session_state["_force_recalibrate_flag"] = True
+        st.rerun()
+
+    weights_label = ", ".join(f"{w * 100:.0f}%" for w in territory_weights)
+    st.caption(f"Current territory weights (Big Chances / SOT / Box Touches): **{weights_label}**")
+    cal_col1, cal_col2 = st.columns([2, 1])
+    if cal_col1.button("🎯 Calibrate territory weights for this league (runs a backtest - may take a moment)"):
+        with st.spinner(f"Searching territory-weight combinations for {division}..."):
+            new_weights, weight_info = E.optimize_territory_weights(settled_div, half_life)
+        st.session_state.territory_weights_by_league[division] = new_weights
+        set_cached_territory_weights(division, new_weights)
+        if "equal_weight_score" in weight_info and "brier_scores_by_weights" in weight_info:
+            chosen_score = weight_info["brier_scores_by_weights"][weight_info["chosen"]]
+            improvement = weight_info["equal_weight_score"] - chosen_score
+            st.success(
+                f"✅ Calibrated: Big Chances {new_weights[0]*100:.0f}% / SOT {new_weights[1]*100:.0f}% / "
+                f"Box Touches {new_weights[2]*100:.0f}%. Brier score improved from "
+                f"{weight_info['equal_weight_score']:.4f} (equal weights) to {chosen_score:.4f} "
+                f"({'better' if improvement > 0 else 'no better'} by {abs(improvement):.4f})."
+            )
+        else:
+            st.info(weight_info.get("reason", "Calibration ran, but couldn't compare against equal weights."))
+        # Every engine-weight / duel / mismatch score depends on the territory weights, so re-tune them now.
+        run_tactics_optimisation(division, settled_div, half_life, new_weights)
+        st.session_state["_force_recalibrate_flag"] = True  # weights changed - rho/BSS/calibrators depend on them
+        st.rerun()
+    if cal_col2.button("↩️ Reset to equal weights", disabled=division not in st.session_state.territory_weights_by_league):
+        st.session_state.territory_weights_by_league.pop(division, None)
+        cache = st.session_state.get("_league_params_disk_cache") or load_league_params_cache()
+        cache.get("_territory_weights", {}).pop(division, None)
+        st.session_state["_league_params_disk_cache"] = cache
+        save_league_params_cache(cache)
+        run_tactics_optimisation(division, settled_div, half_life, E.TERRITORY_WEIGHTS_DEFAULT)
+        st.session_state["_force_recalibrate_flag"] = True
+        st.rerun()
+
+    # --- League tactics: engine weights, duel strength, tactical-mismatch strength ---
+    if engine_weights:
+        ew_label = ", ".join(f"{k} {v * 100:.0f}%" for k, v in engine_weights.items())
+        st.caption(f"Engine blend for this league (chosen by Brier score, validated on held-out matches): **{ew_label}**")
+    else:
+        st.caption("Engine blend for this league: **automatic** (each engine weighted by its measured reliability; territorial always included).")
+    st.caption(f"Duel-multiplier strength: **{duel_strength:.2f}**  ·  Tactical-mismatch strength: **{mismatch_strength:.2f}**  (0 = off, 1 = full)")
+    ew_col1, ew_col2 = st.columns([2, 1])
+    if ew_col1.button("🎛️ Let the model tune engine weights, duel strength and tactical mismatch for this league (Brier score - 1 to 3 minutes)"):
+        run_tactics_optimisation(division, settled_div, half_life, territory_weights)
+        st.rerun()
+    is_default_cfg = engine_weights is None and duel_strength == 1.0 and mismatch_strength == 1.0
+    if ew_col2.button("↩️ Back to defaults", disabled=is_default_cfg):
+        st.session_state.engine_weights_by_league[division] = None
+        set_cached_engine_config(division, None)
+        st.session_state["_force_recalibrate_flag"] = True
+        st.rerun()
+    ew_report = st.session_state.get("_engine_weight_report", {}).get(division)
+    if ew_report:
+        with st.expander("🎛️ League tactics tuning result", expanded=True):
+            eng = ew_report.get("engine", {})
+            (st.success if eng.get("adopted") else st.info)("Engines: " + eng.get("reason", ew_report.get("reason", "")))
+            if "chosen_weights" in eng:
+                st.write("Best engine blend found:", eng["chosen_weights"])
+                val = eng["validation_brier"]
+                st.dataframe(pd.DataFrame({"Brier on held-out matches (lower = better)": {
+                    k: round(v, 4) for k, v in val.items() if k in ("automatic", "chosen", "equal", "territorial only")}}),
+                    use_container_width=True)
+                st.caption(f"Searched on {eng['n_train']} matches, checked on the {eng['n_validation']} most recent "
+                           f"(improvement {val['improvement_vs_automatic']:+.4f} Brier, z = {val['improvement_z_score']:.2f}; adopted only when clearly better than noise).")
+            if ew_report.get("duel"):
+                st.write("Duel multiplier: " + ew_report["duel"].get("reason", ""))
+            if ew_report.get("mismatch"):
+                st.write("Tactical mismatch: " + ew_report["mismatch"].get("reason", ""))
+    if mismatch_table:
+        with st.expander(f"🎭 Learned tactical-mismatch multipliers for {division} (every style pairing seen so far)"):
+            st.caption("Each row: when a team of the first style plays AT HOME against a team of the second style, how the "
+                       "home and away sides' goals compared with what the model expected from ratings alone. Shrunk towards "
+                       "1.00 for small samples and capped at ±10%. Applied automatically at the strength shown above.")
+            mm_rows = [{"Home style": h, "Away style": a_, "Matches": v["n"], "Home goals ×": round(v["home"], 3), "Away goals ×": round(v["away"], 3)}
+                       for (h, a_), v in mismatch_table.items()]
+            st.dataframe(pd.DataFrame(mm_rows).sort_values("Matches", ascending=False), use_container_width=True, hide_index=True)
+
+    # --- Territory vectors + baseline ---
+    baseline = E.compute_league_baseline(settled_div)
+
+    with st.expander(f"📐 This League's Real Baseline ({division})", expanded=True):
+        st.caption(
+            f"Season-aware: the current season counts fully, each earlier season counts x{E.SEASON_CARRYOVER:.2f} "
+            "of the one after it (adjust with the carry-over slider above)."
+        )
+        st.caption(
+            "These are the actual, real numbers computed directly from this league's own "
+            "settled matches - genuinely different from league to league. Team ratings "
+            "elsewhere are each team's own stats divided by these numbers, so a rating of "
+            "1.00 always means 'exactly average for THIS league' by definition - it's not a "
+            "sign the underlying average itself is stuck at a fixed value."
+        )
+        bl1, bl2 = st.columns(2)
+        bl1.metric("⚽ Avg Home Goals", f"{baseline.avg_home_goals:.2f}")
+        bl2.metric("⚽ Avg Away Goals", f"{baseline.avg_away_goals:.2f}")
+        bl3, bl4, bl5 = st.columns(3)
+        bl3.metric("🎯 Avg Big Chances (Home)", f"{baseline.home_big_chances_for:.2f}")
+        bl4.metric("🥅 Avg SOT (Home)", f"{baseline.home_sot_for:.2f}")
+        bl5.metric("📦 Avg Box Touches (Home)", f"{baseline.home_box_for:.1f}")
+
+    # ONE shared pipeline (territorial + auxiliary-engine blend + duel + momentum) - the exact same
+    # function the walk-forward backtest runs, so the reliability badge and calibration describe
+    # THIS model, not a simpler one. Engine reliabilities are computed from settled matches only.
+    engine_reliabilities = E.compute_engine_reliabilities(settled_div, territory_weights)
+    ms = E.compute_match_strengths(
+        settled_div, home_team, away_team, half_life, reference_date, territory_weights,
+        use_match_index=use_match_index, reliabilities=engine_reliabilities, include_momentum=True, baseline=baseline,
+        engine_weights=engine_weights, duel_strength=duel_strength,
+    )
+    home_profile, away_profile = ms.home_profile, ms.away_profile
+    home_attack_territorial, home_defense_territorial = ms.home_attack_territorial, ms.home_defense_territorial
+    away_attack_territorial, away_defense_territorial = ms.away_attack_territorial, ms.away_defense_territorial
+    setpiece_reliability = engine_reliabilities["setpiece"]
+    transition_reliability = engine_reliabilities["transition"]
+    xg_reliability = engine_reliabilities["xg"]
+    xg_set_play_reliability = engine_reliabilities["xg_set_play"]
+    xg_open_play_reliability = engine_reliabilities["xg_open_play"]
+    home_attack, home_defense, away_attack, away_defense = ms.home_attack, ms.home_defense, ms.away_attack, ms.away_defense
+    home_attack_breakdown, home_defense_breakdown = ms.home_attack_breakdown, ms.home_defense_breakdown
+    away_attack_breakdown, away_defense_breakdown = ms.away_attack_breakdown, ms.away_defense_breakdown
+    home_du_defense, away_du_defense = ms.home_du_defense, ms.away_du_defense
+    home_attack_raw, away_attack_raw = ms.home_attack_raw, ms.away_attack_raw  # blended, BEFORE momentum
+    home_mom_mult, home_mom_desc = ms.home_mom_mult, ms.home_mom_desc
+    away_mom_mult, away_mom_desc = ms.away_mom_mult, ms.away_mom_desc
+
+    with st.expander("🧩 Auxiliary Engines (set-piece, transition, duel-resilience, xG)"):
+        if not any([setpiece_reliability.available, transition_reliability.available, xg_reliability.available]):
+            st.caption(
+                "No set-piece/transition/duel/xG columns detected in this dataset - predictions "
+                "are running on territorial data alone, same as before. Add "
+                "corner_kicks, fouled_in_final_third, accurate_crosses, successful_crosses_percentage, "
+                "accurate_long_passes, successful_long_passes_percentage (long passes - volume and "
+                "accuracy%), final_third_entries, dribbles_percentage, tackles_won_percentage, "
+                "ground_duels_percentage, aerial_duels_percentage, goalkeeper_saves, and/or "
+                "xg columns to enable them."
+            )
+        else:
+            st.caption(
+                "Each engine only contributes if its columns are present AND it correlates "
+                "with real goal difference in THIS league - the weight breakdown below shows "
+                "how much each one is actually being trusted here, automatically, per league. "
+                "Provider xG, when present, typically earns the largest weight of the auxiliary "
+                "engines - it's a direct shot-quality measurement rather than a reconstructed proxy."
+            )
+            aux_col1, aux_col2 = st.columns(2)
+            with aux_col1:
+                st.markdown(f"**🏠 {home_team} attack blend**")
+                st.json(home_attack_breakdown)
+                st.markdown(f"**🏠 {home_team} defense blend**")
+                st.json(home_defense_breakdown)
+            with aux_col2:
+                st.markdown(f"**✈️ {away_team} attack blend**")
+                st.json(away_attack_breakdown)
+                st.markdown(f"**✈️ {away_team} defense blend**")
+                st.json(away_defense_breakdown)
+            rel_display = []
+            for rel in (setpiece_reliability, transition_reliability, xg_reliability):
+                rel_display.append({
+                    "Engine": rel.engine_name, "Available": rel.available,
+                    "Proxy correlation": rel.proxy_correlation if rel.available else "n/a",
+                    "Composite score": rel.composite_score if rel.available else "n/a",
+                })
+            st.dataframe(pd.DataFrame(rel_display), use_container_width=True, hide_index=True)
+            if home_du_defense is not None or away_du_defense is not None:
+                _fmt = lambda v: f"{v:.3f}x" if v is not None else "n/a"
+                st.caption(
+                    f"Duel-resilience multiplier applied on top of defense - "
+                    f"{home_team}: {_fmt(home_du_defense)}, {away_team}: {_fmt(away_du_defense)} "
+                    f"(below 1.0 = wins MORE duels/tackles than the league average = more resilient = fewer goals conceded; "
+                    f"limited to {E.DUEL_MULT_FLOOR:.2f}-{E.DUEL_MULT_CEILING:.2f})."
+                )
+
+    # --- Effective sample size + finishing-quality conversion (for/against) ---
+    # Prefers xGOT (post-shot expected goals - see team_xgot_conversion_profile's
+    # docstring) when this league's provider covers it; falls back to the
+    # SOT-based ratio otherwise. This was previously computed in the engine
+    # but never actually preferred here - always fell back to SOT even when
+    # xGOT was available.
+    league_avg_xgot_conversion = E.league_average_xgot_conversion(settled_div)
+    using_xgot = league_avg_xgot_conversion is not None
+    league_avg_conversion = league_avg_xgot_conversion if using_xgot else E.league_average_sot_conversion(settled_div)
+    conversion_profile_fn = E.team_xgot_conversion_profile if using_xgot else E.team_sot_conversion_profile
+    home_sot_conv = conversion_profile_fn(
+        settled_div, home_team, "home", half_life, reference_date, league_avg_conversion, use_match_index=use_match_index
+    )
+    away_sot_conv = conversion_profile_fn(
+        settled_div, away_team, "away", half_life, reference_date, league_avg_conversion, use_match_index=use_match_index
+    )
+    home_xga = E.team_expected_goals_against(home_defense, baseline, "home")
+    away_xga = E.team_expected_goals_against(away_defense, baseline, "away")
+
+    league_avg_penetration = E.league_average_penetration_efficiency(settled_div)
+    home_penetration = None
+    away_penetration = None
+    if league_avg_penetration is not None:
+        home_penetration = E.team_penetration_efficiency_profile(
+            settled_div, home_team, "home", half_life, reference_date, league_avg_penetration, use_match_index=use_match_index
+        )
+        away_penetration = E.team_penetration_efficiency_profile(
+            settled_div, away_team, "away", half_life, reference_date, league_avg_penetration, use_match_index=use_match_index
+        )
+
+    conversion_label = "xGOT" if using_xgot else "SOT"
+    with st.expander(f"📐 Sample Size, {conversion_label} Conversion, Expected Goals Against & Penetration Efficiency"):
+        st.caption(
+            f"League-average {conversion_label}-to-goal conversion: **{league_avg_conversion * 100:.1f}%**. Each "
+            "team's own conversion rate below is shrunk toward this league average based on "
+            "effective sample size (ESS) - a thin sample stays close to the league average until "
+            "there's enough of the team's own history to trust it on its own. ESS is 'how many "
+            "equally-weighted matches this decay-weighted sample is actually worth' - usually "
+            "well below the raw match count, since recent matches carry far more weight than old ones."
+        )
+        if using_xgot:
+            st.caption(
+                "🎯 Using xGOT (post-shot expected goals) - a sharper finishing-quality signal than "
+                "raw SOT count, since it accounts for shot placement/power rather than treating every "
+                "shot on target as equally hard to score."
+            )
+        if league_avg_penetration is not None:
+            st.caption(
+                f"League-average field penetration efficiency (box touches per final-third entry): "
+                f"**{league_avg_penetration * 100:.1f}%** - how often a team that reaches the final "
+                "third actually pushes on into the box, versus stalling out or losing the ball there."
+            )
+        ess_col1, ess_col2 = st.columns(2)
+        with ess_col1:
+            st.markdown(f"**🏠 {home_team} (home)**")
+            st.metric(
+                "Effective sample size", f"{home_profile.effective_sample_size:.1f}",
+                help=f"{home_profile.n_matches} raw matches on file at this venue",
+            )
+            if home_sot_conv:
+                st.metric(
+                    f"{conversion_label} conversion FOR", f"{home_sot_conv.sot_conversion_for * 100:.1f}%",
+                    help=f"Raw (unshrunk): {home_sot_conv.raw_sot_conversion_for * 100:.1f}% | shrinkage weight: {home_sot_conv.shrinkage_weight:.2f} (0=all league avg, 1=all own data)",
+                )
+                st.metric(
+                    f"{conversion_label} conversion AGAINST", f"{home_sot_conv.sot_conversion_against * 100:.1f}%",
+                    help=f"Raw (unshrunk): {home_sot_conv.raw_sot_conversion_against * 100:.1f}%",
+                )
+            if home_penetration:
+                st.metric(
+                    "🎯 Field penetration efficiency", f"{home_penetration.sot_conversion_for * 100:.1f}%",
+                    help=f"Box touches per final-third entry - raw (unshrunk): {home_penetration.raw_sot_conversion_for * 100:.1f}% | shrinkage weight: {home_penetration.shrinkage_weight:.2f}",
+                )
+            st.metric(
+                "⚽ Expected Goals Against (xGA)", f"{home_xga:.2f}",
+                help="How many goals this team would be expected to concede at this venue against a LEAGUE-AVERAGE attacker - a standalone defensive rating, not tied to today's specific opponent.",
+            )
+        with ess_col2:
+            st.markdown(f"**✈️ {away_team} (away)**")
+            st.metric(
+                "Effective sample size", f"{away_profile.effective_sample_size:.1f}",
+                help=f"{away_profile.n_matches} raw matches on file at this venue",
+            )
+            if away_sot_conv:
+                st.metric(
+                    f"{conversion_label} conversion FOR", f"{away_sot_conv.sot_conversion_for * 100:.1f}%",
+                    help=f"Raw (unshrunk): {away_sot_conv.raw_sot_conversion_for * 100:.1f}% | shrinkage weight: {away_sot_conv.shrinkage_weight:.2f} (0=all league avg, 1=all own data)",
+                )
+                st.metric(
+                    f"{conversion_label} conversion AGAINST", f"{away_sot_conv.sot_conversion_against * 100:.1f}%",
+                    help=f"Raw (unshrunk): {away_sot_conv.raw_sot_conversion_against * 100:.1f}%",
+                )
+            if away_penetration:
+                st.metric(
+                    "🎯 Field penetration efficiency", f"{away_penetration.sot_conversion_for * 100:.1f}%",
+                    help=f"Box touches per final-third entry - raw (unshrunk): {away_penetration.raw_sot_conversion_for * 100:.1f}% | shrinkage weight: {away_penetration.shrinkage_weight:.2f}",
+                )
+            st.metric(
+                "⚽ Expected Goals Against (xGA)", f"{away_xga:.2f}",
+                help="How many goals this team would be expected to concede at this venue against a LEAGUE-AVERAGE attacker - a standalone defensive rating, not tied to today's specific opponent.",
+            )
+        if league_avg_penetration is None:
+            st.caption(
+                "ℹ️ Field penetration efficiency needs both final_third_entries and box_touches "
+                "columns - not detected in this dataset, so it's hidden above rather than shown "
+                "as a fabricated value."
+            )
+        st.caption(
+            "ℹ️ xGA here is opponent-INDEPENDENT (vs. a neutral league-average attacker) - for "
+            "the actual expected goals in TODAY's specific matchup (which is also, symmetrically, "
+            "each team's expected goals against THIS particular opponent), see the 'Model "
+            "expected goals' line further down, once tactical multipliers are applied."
+        )
+
+    # --- Momentum banner ---
+    # (momentum multipliers were already applied to attack inside E.compute_match_strengths)
+    st.subheader("🔥 Momentum & Streak Banner")
+    mb1, mb2 = st.columns(2)
+    mb1.info(f"🏠 **{home_team}**: {home_mom_desc}")
+    mb2.info(f"✈️ **{away_team}**: {away_mom_desc}")
+
+    # --- GD vs xGD (snapshot) + xG trend (direction of travel) - two
+    # different, complementary questions: GD-vs-xGD asks "does the last-5
+    # results picture match the process", xG trend asks "is that process
+    # itself getting better or worse within the window" - a team can show
+    # a solid positive xGD snapshot while still fading late in the window
+    # (also what the "[dampened/boosted ...]" tag on the momentum banner
+    # above is drawing from - the snapshot half specifically).
+    home_gd_xgd = E.team_gd_vs_xgd(settled_div, home_team)
+    away_gd_xgd = E.team_gd_vs_xgd(settled_div, away_team)
+    home_xg_trend = E.team_xg_trend(settled_div, home_team)
+    away_xg_trend = E.team_xg_trend(settled_div, away_team)
+    with st.expander("📊 GD vs xGD & xG Trend — Process vs. Results"):
+        st.caption(
+            "Real Goal Difference vs. expected Goal Difference (xGF-xGA) over each "
+            "team's last 5 matches - a mismatch flags a team whose recent form may not "
+            "hold up (or may be about to turn around). This is the same check feeding "
+            "the momentum dampener above, shown here on its own for both teams."
+        )
+        gd_rows = []
+        for label, insight in ((f"🏠 {home_team}", home_gd_xgd), (f"✈️ {away_team}", away_gd_xgd)):
+            if insight is None:
+                continue
+            gd_rows.append({
+                "Team": label, "Matches": insight.window_matches,
+                "GD": insight.goal_difference,
+                "xGD": insight.xg_difference if insight.xg_difference is not None else "n/a",
+                "Gap (GD-xGD)": insight.gap if insight.gap is not None else "n/a",
+                "Read": insight.quadrant,
+            })
+        if gd_rows:
+            st.dataframe(pd.DataFrame(gd_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Not enough match history for either team yet.")
+
+        st.caption(
+            "**xG trend** - is underlying performance improving or declining WITHIN the "
+            "window (a linear slope across matches), not just where it nets out overall. "
+            "A team can have a solid positive xGD snapshot above while still fading here."
+        )
+        trend_rows = []
+        for label, trend in ((f"🏠 {home_team}", home_xg_trend), (f"✈️ {away_team}", away_xg_trend)):
+            if trend is None:
+                continue
+            trend_rows.append({
+                "Team": label, "Matches": trend.window_matches,
+                "Slope (xGD/match)": trend.slope_per_match,
+                "Avg xGD": trend.recent_xgd_avg,
+                "Read": trend.trend_label,
+            })
+        if trend_rows:
+            st.dataframe(pd.DataFrame(trend_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Not enough xG history for either team yet (needs 4+ matches with xG data).")
+
+    # --- Section 6: tactical multipliers ---
+    st.subheader("🎚️ Tactical & Environmental Multipliers")
+    tc1, tc2 = st.columns(2)
+    with tc1:
+        st.markdown(f"**🏠 {home_team} (Host)**")
+        home_newly_relegated = st.checkbox("🔽 Newly relegated", key="home_relegated")
+        home_relegation_threat = st.checkbox("📉 Live relegation threat", key="home_threat")
+        home_striker_injury = st.checkbox("🏥⚽ Key striker/attacker out", key="home_striker_inj")
+        home_defender_injury = st.checkbox("🏥🛡️ Key defender out", key="home_defender_inj")
+        home_bogey = st.checkbox("🔮 Historical bogey hex (home venue)", key="home_bogey")
+        home_new_manager = st.checkbox("🧠 New manager bounce", key="home_manager")
+        home_boardroom_crisis = st.checkbox("⚠️ Boardroom crisis", key="home_crisis")
+        home_dead_rubber = st.checkbox("🥱 Dead rubber / beach mode", key="home_dead")
+        home_cup_distraction = st.checkbox("🏆 Look-ahead cup penalty", key="home_cup")
+        host_travel_units = st.selectbox("🚌 Host's own mid-week travel fatigue", [0, 1, 2, 3], key="host_travel")
+        home_tactical_setup = st.selectbox(
+            "📐 Host tactical setup",
+            ["Standard Open Play", "Deep Ultra-Defensive Low-Block", "High-Intensity Counter-Pressing Style"],
+            key="home_tactic_setup",
+        )
+        home_departure_impact = st.slider(
+            "📤 Key player departure impact", -20.0, 0.0, 0.0, step=1.0,
+            key="home_departure_impact",
+            help="A key player LEFT - negative only. No universal research figure for a "
+                 "specific transfer's impact (see the engine's realism notes) - set based on "
+                 "your own judgement of the player's importance.",
+        )
+        home_new_signing_impact = st.slider(
+            "📥 New signing impact", 0.0, 20.0, 0.0, step=1.0,
+            key="home_new_signing_impact",
+            help="A quality player ARRIVED - positive only. Kept separate from departure "
+                 "impact since a team can lose a starter AND sign a replacement in the same "
+                 "window, and a new signing's real impact often takes weeks to show up.",
+        )
+    with tc2:
+        st.markdown(f"**✈️ {away_team} (Visitor)**")
+        away_newly_relegated = st.checkbox("🔽 Newly relegated", key="away_relegated")
+        away_relegation_threat = st.checkbox("📉 Live relegation threat", key="away_threat")
+        away_striker_injury = st.checkbox("🏥⚽ Key striker/attacker out", key="away_striker_inj")
+        away_defender_injury = st.checkbox("🏥🛡️ Key defender out", key="away_defender_inj")
+        away_bogey = st.checkbox("🔮 Historical bogey hex (away venue)", key="away_bogey")
+        away_new_manager = st.checkbox("🧠 New manager bounce", key="away_manager")
+        away_boardroom_crisis = st.checkbox("⚠️ Boardroom crisis", key="away_crisis")
+        away_dead_rubber = st.checkbox("🥱 Dead rubber / beach mode", key="away_dead")
+        away_cup_distraction = st.checkbox("🏆 Look-ahead cup penalty", key="away_cup")
+        away_travel_units = st.selectbox("🚌 Visitor's mid-week travel fatigue (arriving here)", [0, 1, 2, 3], key="away_travel")
+        away_tactical_setup = st.selectbox(
+            "📐 Visitor tactical setup",
+            ["Standard Open Play", "Deep Ultra-Defensive Low-Block", "High-Intensity Counter-Pressing Style"],
+            key="away_tactic_setup",
+        )
+        away_departure_impact = st.slider(
+            "📤 Key player departure impact", -20.0, 0.0, 0.0, step=1.0,
+            key="away_departure_impact",
+            help="A key player LEFT - negative only.",
+        )
+        away_new_signing_impact = st.slider(
+            "📥 New signing impact", 0.0, 20.0, 0.0, step=1.0,
+            key="away_new_signing_impact",
+            help="A quality player ARRIVED - positive only, kept separate from departure impact.",
+        )
+
+    st.markdown("**🌍 Universal Match Conditions**")
+    uc1, uc2, uc3, uc4, uc5 = st.columns(5)
+    coastal_shock = uc1.checkbox("🌦️ High-humidity coastal shock (visitor)", key="coastal")
+    pre_season = uc2.checkbox("🌱 Pre-season fixture", key="pre_season")
+    derby_match = uc5.checkbox(
+        "🔥 Derby / rivalry match", key="derby_match",
+        help="Tightens both teams' defense and bumps volatility - rivalry games research "
+             "consistently shows more cards/fouls and tighter scorelines than underlying "
+             "quality alone would suggest, favoring neither side specifically.",
+    )
+    pitch_surface = uc3.selectbox(
+        "🌱 Pitch surface", ["Standard Optimized Turf", "Waterlogged Mud", "Dry Uneven Grass, short and narrow"],
+        key="pitch_surface",
+    )
+    weather = uc4.selectbox(
+        "☁️ Weather outlook", ["Clear Sky (no rain/wind)", "Torrential Rain Storm", "Gale-Force Wind Interference"],
+        key="weather",
+    )
+    referee_strictness = st.radio(
+        "🟨 Referee Strictness Profile",
+        ["Lenient (Flow Enforcer)", "Standard Average", "Hyper-Strict (Card Trigger)"],
+        horizontal=True, key="referee_strictness",
+    )
+
+    st.markdown("**🌡️ Heat Stress (>25°C — distinct from Weather above: this is player fatigue, not ball physics)**")
+    hs1, hs2, hs3 = st.columns(3)
+    heat_stress_level = hs1.selectbox(
+        "Matchday temperature", options=[0, 1, 2, 3],
+        format_func=lambda x: {0: "Below 25°C (ideal, no effect)", 1: "25–30°C", 2: "30–35°C", 3: "35°C+"}[x],
+        key="heat_stress_level",
+        help="Cardiovascular fatigue accumulation - reduced high-intensity running and more "
+             "fatigue-driven errors for both teams, distinct from rain/wind (which affect the "
+             "ball, not the players).",
+    )
+    home_heat_acclimatized = hs2.checkbox(
+        f"🏠 {home_team} heat-acclimatized", key="home_heat_acclimatized",
+        help="This team's normal home climate is characteristically hot - real physiological "
+             "adaptation means roughly half the attack penalty and volatility bump of a "
+             "non-acclimatized team at the same temperature level.",
+    )
+    away_heat_acclimatized = hs3.checkbox(
+        f"✈️ {away_team} heat-acclimatized", key="away_heat_acclimatized",
+    )
+
+    # Fixture congestion is COMPUTED, never manually toggled - counts each
+    # team's real matches in the 10 days before THIS fixture's actual date
+    # (the selected upcoming fixture's own scheduled date, not just the
+    # latest settled-match date used for decay weighting elsewhere).
+    home_congestion_n, home_congestion_desc = E.compute_fixture_congestion(settled_div, home_team, fixture_date)
+    away_congestion_n, away_congestion_desc = E.compute_fixture_congestion(settled_div, away_team, fixture_date)
+    st.caption(
+        f"📅 Fixture congestion (auto-computed): {home_team} — {home_congestion_desc} | "
+        f"{away_team} — {away_congestion_desc}"
+    )
+
+    tactics = E.TacticalInputs(
+        home_newly_relegated=home_newly_relegated, away_newly_relegated=away_newly_relegated,
+        home_relegation_threat=home_relegation_threat, away_relegation_threat=away_relegation_threat,
+        home_striker_injury=home_striker_injury, away_striker_injury=away_striker_injury,
+        home_defender_injury=home_defender_injury, away_defender_injury=away_defender_injury,
+        home_bogey=home_bogey, away_bogey=away_bogey,
+        home_new_manager=home_new_manager, away_new_manager=away_new_manager,
+        home_boardroom_crisis=home_boardroom_crisis, away_boardroom_crisis=away_boardroom_crisis,
+        home_dead_rubber=home_dead_rubber, away_dead_rubber=away_dead_rubber,
+        home_travel_fatigue_units=away_travel_units, host_travel_fatigue_units=host_travel_units,
+        coastal_shock=coastal_shock,
+        home_cup_distraction=home_cup_distraction, away_cup_distraction=away_cup_distraction,
+        home_tactical_setup=home_tactical_setup, away_tactical_setup=away_tactical_setup,
+        pitch_surface=pitch_surface, weather=weather, referee_strictness=referee_strictness,
+        pre_season_fixture=pre_season,
+        home_departure_impact_pct=home_departure_impact, away_departure_impact_pct=away_departure_impact,
+        home_new_signing_impact_pct=home_new_signing_impact, away_new_signing_impact_pct=away_new_signing_impact,
+        derby_match=derby_match,
+        home_congestion_matches=home_congestion_n, away_congestion_matches=away_congestion_n,
+        heat_stress_level=heat_stress_level,
+        home_heat_acclimatized=home_heat_acclimatized, away_heat_acclimatized=away_heat_acclimatized,
+    )
+    home_adj, away_adj, vol_adjusted, tactic_log = E.apply_tactical_multipliers(
+        home_attack, home_defense, away_attack, away_defense, vol_profile.vol_dampener, tactics,
+    )
+    if tactic_log:
+        with st.expander("📜 Applied multiplier log"):
+            for line in tactic_log:
+                st.text(line)
+
+    # --- Run both engines ---
+    lam_home, lam_away = E.expected_goals(home_adj.attack, away_adj.defense, away_adj.attack, home_adj.defense, baseline)
+    # --- Automatic tactical-mismatch multiplier (style vs style, learned from this league's own history) ---
+    mm_home, mm_away = E.mismatch_multipliers(mismatch_table, ms.home_style, ms.away_style, mismatch_strength)
+    lam_home, lam_away = max(0.05, lam_home * mm_home), max(0.05, lam_away * mm_away)
+    _cell = mismatch_table.get((ms.home_style, ms.away_style))
+    st.info(
+        f"🎭 Style matchup: **{home_team}** = {ms.home_style}  vs  **{away_team}** = {ms.away_style}. "
+        + (f"Learned from {_cell['n']} similar past matches in this league → {home_team} expected goals ×{mm_home:.3f}, "
+           f"{away_team} ×{mm_away:.3f} (mismatch strength {mismatch_strength:.2f}; already included in the numbers below)."
+           if _cell else "No past matches with this exact pairing yet, so no mismatch adjustment (×1.000).")
+    )
+    st.caption(
+        f"⚽ Model expected goals — {home_team}: **{lam_home:.2f}**, {away_team}: **{lam_away:.2f}** "
+        f"(symmetrically: {lam_home:.2f} is also {away_team}'s expected goals AGAINST in this specific "
+        f"matchup, and {lam_away:.2f} is {home_team}'s - see the standalone, opponent-independent xGA "
+        "ratings in the expander above for each team's general defensive quality)"
+    )
+
+    st.caption(f"📐 Dixon-Coles ρ (fitted from this division's own low-score history, cached alongside the reliability backtest above): **{rho:.3f}**")
+    matrix = E.build_score_matrix(lam_home, lam_away, rho)
+
+    # --- Corners engine (independent of goals - see corners_league_baseline
+    # / expected_corners docstrings) - corner_lambdas stays None (no
+    # fabricated market) unless corner_kicks data is actually present and
+    # both teams clear the minimum sample size.
+    corners_baseline = E.corners_league_baseline(settled_div)
+    home_corners_profile = E.corners_team_profile(settled_div, home_team, "home", half_life, reference_date, use_match_index=use_match_index)
+    away_corners_profile = E.corners_team_profile(settled_div, away_team, "away", half_life, reference_date, use_match_index=use_match_index)
+    corner_lambdas = E.expected_corners(home_corners_profile, away_corners_profile, corners_baseline)
+    if corner_lambdas is not None:
+        st.caption(f"🚩 Model expected corners — {home_team}: **{corner_lambdas[0]:.1f}**, {away_team}: **{corner_lambdas[1]:.1f}**")
+
+    dc_probs = E.market_probs_from_matrix(matrix, corner_lambdas=corner_lambdas)
+
+    hg_sim, ag_sim = E.monte_carlo_simulate(lam_home, lam_away, volatility_dampener=vol_adjusted, iterations=E.MC_ITERATIONS)
+    mc_probs = E.market_probs_from_simulation(hg_sim, ag_sim, corner_lambdas=corner_lambdas)
+
+    # --- ALL-MARKET probability calibration (Platt/Isotonic, auto-selected per market) ---
+    # Runs immediately after dc_probs/mc_probs are computed and BEFORE build_valuation_sheet()
+    # is called further down - every EV/convergence/verdict calculation downstream already
+    # sees calibrated numbers, for every market, not just Home/Draw/Away.
+    apply_calibration = st.checkbox(
+        f"🎯 Apply probability calibration for all {N_MARKETS} markets (Platt/Isotonic, auto-selected per market)",
+        value=True, key="apply_market_calibration",
+        help="Corrects every market's probability using this league's own backtest history, "
+             "via whichever of Platt scaling or isotonic regression scored better on held-out "
+             "cross-validation for THAT specific market (or no correction, if neither beat the "
+             "raw baseline). Complementary groups (Home/Draw/Away, Over/Under pairs, BTTS, "
+             "Draw No Bet, the AH line-pairs, and the Multi Score set) are "
+             "renormalised after calibration so they still sum to 1. Uncheck to see the "
+             "model's raw, uncorrected output.",
+    )
+    if apply_calibration and market_calibrators:
+        raw_dc_probs = dict(dc_probs)
+        raw_mc_probs = dict(mc_probs)
+        dc_probs = E.apply_all_market_calibration(dc_probs, market_calibrators)
+        mc_probs = E.apply_all_market_calibration(mc_probs, market_calibrators_mc if market_calibrators_mc else market_calibrators)
+
+        with st.expander(f"🎯 Calibration Detail (raw vs. corrected, all {N_MARKETS} markets)"):
+            st.caption(
+                "Each market independently chose Platt scaling, isotonic regression, or no "
+                "correction - whichever scored best on held-out cross-validated log-loss "
+                "against this league's own backtest history. This IS the calibration table "
+                "used to correct the numbers above, automatically, before they reached the "
+                "valuation sheet below."
+            )
+            st.dataframe(E.all_market_calibration_summary_table(market_calibrators), use_container_width=True, hide_index=True)
+            compare_rows = []
+            skipped_markets = []
+            for market in E.MARKET_LIST:
+                # Markets like Corners (needs corner_kicks data, not every league has it)
+                # are simply ABSENT from these dicts when their underlying data wasn't
+                # available for this league - not an error, just "not computable here".
+                # Skip the row rather than crash on a missing key.
+                if market not in raw_dc_probs or market not in dc_probs:
+                    skipped_markets.append(market)
+                    continue
+                compare_rows.append({
+                    "Market": market,
+                    "Raw Dixon-Coles %": round(raw_dc_probs[market] * 100, 2),
+                    "Calibrated Dixon-Coles %": round(dc_probs[market] * 100, 2),
+                    "Raw Monte Carlo %": round(raw_mc_probs.get(market, float("nan")) * 100, 2) if market in raw_mc_probs else "n/a",
+                    "Calibrated Monte Carlo %": round(mc_probs.get(market, float("nan")) * 100, 2) if market in mc_probs else "n/a",
+                })
+            st.dataframe(pd.DataFrame(compare_rows), use_container_width=True, hide_index=True)
+            if skipped_markets:
+                st.caption(
+                    f"ℹ️ {len(skipped_markets)} market(s) not shown above (no underlying data "
+                    f"for this league, e.g. corners): {', '.join(skipped_markets)}"
+                )
+    elif apply_calibration and not market_calibrators:
+        st.caption(
+            "ℹ️ Not enough backtest history yet for this league to fit a calibration "
+            "correction (needs 40+ walk-forward predictions per outcome class) - showing "
+            "raw, uncorrected probabilities."
+        )
+
+    # --- Dynamic prediction explanation ---
+    st.subheader("🧾 Why This Prediction Was Made")
+    explanation = E.generate_prediction_explanation(
+        home_team, away_team, half_life, freeze_decay,
+        home_attack_raw, away_attack_raw,
+        home_mom_mult, home_mom_desc, away_mom_mult, away_mom_desc,
+        tactic_log, rho, lam_home, lam_away, dc_probs, mc_probs, vol_adjusted,
+    )
+    st.markdown(explanation)
+
+    # --- Charts: exact scoreline comparison + goal totals for both engines ---
+    st.subheader("📈 Engine Comparison Charts")
+    ch1, ch2 = st.columns(2)
+    with ch1:
+        st.caption("Dixon-Coles: most likely exact scorelines")
+        size = matrix.shape[0]
+        flat = [(f"{h}-{a}", matrix[h, a]) for h in range(min(size, 5)) for a in range(min(size, 5))]
+        flat_sorted = sorted(flat, key=lambda x: -x[1])[:8]
+        score_df = pd.DataFrame(flat_sorted, columns=["Scoreline", "Probability"]).set_index("Scoreline")
+        st.bar_chart(score_df)
+    with ch2:
+        st.caption("Monte Carlo: simulated total-goals distribution")
+        total_goals_sim = hg_sim + ag_sim
+        totals_counts = pd.Series(total_goals_sim).value_counts().sort_index()
+        totals_counts.index = totals_counts.index.astype(str)
+        st.bar_chart(totals_counts)
+
+    engine_compare_df = pd.DataFrame({
+        "Dixon-Coles %": [dc_probs["Home Win"] * 100, dc_probs["Draw"] * 100, dc_probs["Away Win"] * 100],
+        "Monte Carlo %": [mc_probs["Home Win"] * 100, mc_probs["Draw"] * 100, mc_probs["Away Win"] * 100],
+    }, index=["Home Win", "Draw", "Away Win"])
+    st.caption("Home / Draw / Away probability - both engines side by side")
+    st.bar_chart(engine_compare_df)
+
+    # --- Section 8: valuation sheet ---
+    st.subheader(f"📋 {len(E.MARKET_LIST)}-Market Options Valuation Sheet")
+    st.caption("Edit the Bookmaker Odds for any market you want to check - everything else recalculates live.")
+
+    odds_meta = st.session_state.get("odds_upload_meta")
+    with st.expander("📥 Upload pre-match odds instead of typing them", expanded=bool(odds_meta)):
+        st.caption(
+            "Upload a CSV from your odds provider and the prices are filled in for you. Only markets this model prices are read; "
+            "everything else (other total-goals lines, Asian quarter lines, markets it does not model) is ignored, and the list of what "
+            "was skipped is shown below."
+        )
+        st.download_button(
+            "⬇ Blank odds template (one row per market)", E.market_template().to_csv(index=False).encode("utf-8-sig"),
+            file_name="sisonke_odds_template.csv", mime="text/csv", key="odds_template_dl",
+        )
+        odds_file = st.file_uploader("Odds file (CSV)", type="csv", key="odds_upload_file")
+        if odds_file is not None:
+            try:
+                odds_raw = pd.read_csv(odds_file)
+                odds_probe = E.import_odds_file(odds_raw)
+            except Exception as exc:  # noqa: BLE001 - show the problem, never crash the page
+                odds_probe = E.OddsImportResult("unknown", error=f"Could not read the file: {exc}")
+            if odds_probe.error:
+                st.error(odds_probe.error)
+            else:
+                book_choice, price_choice, age_hours, age_ref = None, "last_seen", None, "now"
+                # 1) the stale-price filter comes first, so the bookmaker list below only counts prices that survive it
+                if odds_probe.has_timestamps:
+                    ac1, ac2, ac3 = st.columns([1, 2, 2])
+                    if ac1.toggle("🕒 Ignore stale prices", value=True, key="odds_upload_age_on"):
+                        age_hours = ac2.slider("Ignore prices older than (hours)", 0.5, 168.0, 24.0, step=0.5, key="odds_upload_age_h2")
+                        age_ref = ac3.radio("Measured from", ["now", "newest"], horizontal=True, key="odds_upload_age_ref",
+                                            format_func=lambda k: "Now" if k == "now" else "Newest price in the file")
+                    st.caption(f"Prices in this file were taken between {odds_probe.oldest_price} and {odds_probe.newest_price} (UTC).")
+                elif odds_probe.file_format == "sportmonks":
+                    st.caption("🕒 This file has no timestamps, so prices cannot be filtered by age. The long Sportmonks layout "
+                               "(one row per price, with latest_bookmaker_update) can.")
+                if age_hours is not None and odds_probe.file_format == "sportmonks":
+                    odds_fresh = E.import_odds_file(odds_raw, None, "last_seen", max_age_hours=age_hours, age_reference=age_ref)
+                else:
+                    odds_fresh = odds_probe
+                # 2) bookmaker (only bookmakers that still have fresh prices are offered, best-covered first)
+                if odds_probe.file_format in ("provider-wide", "sportmonks"):
+                    oc1, oc2 = st.columns(2)
+                    book_options = odds_fresh.bookmakers if odds_probe.file_format == "sportmonks" else odds_probe.bookmakers
+                    default_book = 1 if odds_probe.file_format == "sportmonks" and len(book_options) > 1 else 0
+                    cover = odds_fresh.coverage if odds_probe.file_format == "sportmonks" else {}
+                    book_choice = oc1.selectbox(
+                        "Bookmaker", book_options, index=default_book,
+                        format_func=lambda b: f"{b}  ·  {cover[b]} markets" + (" fresh" if age_hours is not None else "") if b in cover else b,
+                        key=f"odds_upload_book_{odds_file.name}_{abs(hash(tuple(book_options)))}")
+                    if odds_probe.file_format == "provider-wide":
+                        price_choice = oc2.radio(
+                            "Price", ["last_seen", "opening"], horizontal=True, key="odds_upload_price",
+                            format_func=lambda k: "Latest before kickoff" if k == "last_seen" else "Opening price",
+                        )
+                    else:
+                        oc2.caption("The first bookmaker listed is the one with the most fresh markets. "
+                                    f"“{E.SPORTMONKS_BEST_PRICE}” takes the highest price for each market.")
+                odds_result = E.import_odds_file(odds_raw, book_choice, price_choice, max_age_hours=age_hours, age_reference=age_ref)
+                if odds_result.stale_dropped:
+                    st.caption(f"🕒 {odds_result.stale_dropped} stale price(s) ignored.")
+                if odds_result.unstamped_kept:
+                    st.caption(f"⚠ {odds_result.unstamped_kept} price(s) have no update time, so they could not be age-checked.")
+                fixtures_in_file = odds_result.fixtures
+                if not fixtures_in_file or not any(fx.prices for fx in fixtures_in_file):
+                    st.warning("No usable prices were found in this file."
+                               + (f" {odds_result.stale_dropped} price(s) were older than {age_hours:g} hours - widen the age limit, "
+                                  "measure from the newest price in the file, or switch the filter off." if odds_result.stale_dropped and age_hours else ""))
+                else:
+                    auto_idx, auto_score = E.match_fixture(fixtures_in_file, home_team, away_team, fixture_date)
+                    if len(fixtures_in_file) == 1 and fixtures_in_file[0].home is None:
+                        auto_idx, auto_score = 0, 1.0  # a plain market list with no match named: it is for the fixture on screen
+                    pick_default = auto_idx if auto_idx is not None and auto_score >= 0.7 else 0
+                    pick = st.selectbox(
+                        "Which match in the file?", list(range(len(fixtures_in_file))), index=pick_default,
+                        format_func=lambda i: fixtures_in_file[i].label, key=f"odds_upload_match_{odds_file.name}_{book_choice}",
+                    )
+                    chosen_fx = fixtures_in_file[pick]
+                    if auto_idx is not None and auto_score >= 0.7 and pick == auto_idx:
+                        st.success(f"Matched {home_team} vs {away_team} to “{chosen_fx.label}” automatically.")
+                    elif fixtures_in_file[0].home is not None:
+                        st.warning(f"This is not the match on screen ({home_team} vs {away_team}) - check the match you picked before using its prices.")
+                    st.write(f"**{len(chosen_fx.prices)} of the model's {len(E.MARKET_LIST)} markets have a price in this file.**")
+                    st.caption("Prices are read by role: the file's home side is Home and its away side is Away. Team names are only used "
+                               "to find the match, never to read a price.")
+                    reversed_roles = False
+                    if chosen_fx.home and chosen_fx.away:
+                        straight_sim = (E.team_name_similarity(chosen_fx.home, home_team) + E.team_name_similarity(chosen_fx.away, away_team)) / 2
+                        flipped_sim = (E.team_name_similarity(chosen_fx.home, away_team) + E.team_name_similarity(chosen_fx.away, home_team)) / 2
+                        reversed_roles = flipped_sim >= 0.7 and flipped_sim > straight_sim + 0.3
+                        if reversed_roles:
+                            st.error(f"In the file {chosen_fx.home} is the HOME side, but on screen {home_team} is. Applying these prices would put "
+                                     "Home and Away the wrong way round, so they are blocked.")
+                    if chosen_fx.prices:
+                        ref_time = odds_result.reference_time
+                        def _age_text(ts):
+                            if ts is None or ref_time is None:
+                                return ""
+                            hrs = max((ref_time - ts).total_seconds(), 0) / 3600
+                            return f"{hrs * 60:.0f} min" if hrs < 1 else (f"{hrs:.1f} h" if hrs < 48 else f"{hrs / 24:.1f} d")
+                        shown = [(E.market_group(m), m, v, chosen_fx.sources.get(m, ""),
+                                  chosen_fx.stamps[m].strftime("%Y-%m-%d %H:%M") if m in chosen_fx.stamps else "", _age_text(chosen_fx.stamps.get(m)))
+                                 for m, v in chosen_fx.prices.items()]
+                        shown.sort(key=lambda t: (E.MARKET_GROUP_ORDER.index(t[0]) if t[0] in E.MARKET_GROUP_ORDER else 99, E.MARKET_LIST.index(t[1])))
+                        shown_cols = ["Group", "Market", "Odds", "Read from", "Updated (UTC)", "Age"]
+                        if not chosen_fx.stamps:
+                            shown, shown_cols = [t[:4] for t in shown], shown_cols[:4]
+                        st.dataframe(pd.DataFrame(shown, columns=shown_cols), use_container_width=True, hide_index=True, height=240)
+                    if odds_result.ignored or odds_result.notes:
+                        with st.expander("What was ignored, and why"):
+                            for line in odds_result.ignored:
+                                st.write("• Ignored - " + line)
+                            for line in odds_result.notes:
+                                st.write("• " + line)
+                    st.button(
+                        f"✅ Use these {len(chosen_fx.prices)} prices for {home_team} vs {away_team}", type="primary",
+                        disabled=(not chosen_fx.prices) or reversed_roles, key="odds_upload_apply", on_click=apply_uploaded_odds,
+                        args=(dict(chosen_fx.prices), {
+                            "fixture": (home_team, away_team), "bookmaker": book_choice or "file",
+                            "price_type": "latest before kickoff" if price_choice == "last_seen" else "opening", "source_match": chosen_fx.label,
+                            "oldest_used": str(min(chosen_fx.stamps.values()))[:16] if chosen_fx.stamps else None,
+                            "newest_used": str(max(chosen_fx.stamps.values()))[:16] if chosen_fx.stamps else None,
+                        }),
+                    )
+        if odds_meta:
+            if tuple(odds_meta.get("fixture", ())) == (home_team, away_team):
+                st.success(f"Using uploaded odds: {odds_meta['bookmaker']}, {odds_meta['price_type']} - {len(odds_meta['markets'])} markets priced (from “{odds_meta['source_match']}”)."
+                           + (f" Prices last updated {odds_meta['oldest_used']} to {odds_meta['newest_used']} UTC." if odds_meta.get("oldest_used") else ""))
+            else:
+                st.warning(f"Uploaded odds are for {odds_meta['fixture'][0]} vs {odds_meta['fixture'][1]}, not this fixture - they are not used here.")
+            st.button("Clear uploaded odds", key="odds_upload_clear", on_click=clear_uploaded_odds)
+
+    edited_odds = {}
+    for group_index, (group_title, group_rows) in enumerate(E.market_rows().items()):
+        # one drop-down per group keeps 100+ odds boxes tidy; collapsed groups still count (their values are kept).
+        # Each ROW is one bet with its outcomes side by side (Home | Draw | Away, Over | Under, Yes | No).
+        group_markets = [m for row in group_rows for m in row]
+        changed_here = sum(1 for m in group_markets if abs(float(st.session_state.bookmaker_odds.get(m, 2.00)) - 2.00) > 1e-9)
+        label = f"{group_title}  ·  {len(group_markets)} markets" + (f"  ·  {changed_here} odds set" if changed_here else "")
+        with st.expander(label, expanded=(group_index == 0)):
+            ncols = max(len(row) for row in group_rows)
+            for row in group_rows:
+                row_cols = st.columns(ncols)
+                for j, market in enumerate(row):
+                    box_args = {} if f"odds_{market}" in st.session_state else {"value": float(st.session_state.bookmaker_odds.get(market, 2.00))}
+                    edited_odds[market] = row_cols[j].number_input(
+                        market, min_value=1.01, max_value=100.0, step=0.01, key=f"odds_{market}", **box_args,
+                    )
+    st.session_state.bookmaker_odds = edited_odds
+
+    st.markdown("#### 🎚️ Market Filters")
+    st.caption(
+        "A market's own confidence is the probability used for THAT specific bet (set by the EV basis below - by default the "
+        "lower of its Dixon-Coles and Monte Carlo probabilities), not the match's overall outright-winner "
+        "confidence. A market only stays active if it clears BOTH filters below."
+    )
+    gate_col1, gate_col2 = st.columns(2)
+    confidence_floor = gate_col1.slider(
+        "🎚️ Confidence Floor (%)", 0, 100, 0, step=5, key="market_confidence_floor",
+        help="Markets the model isn't at least this confident about get grayed out and excluded from the parlay builder.",
+    )
+    min_ev_gate = gate_col2.slider(
+        "📈 Minimum EV% Gate", -10.0, 20.0, 0.0, step=0.5, key="market_min_ev_gate",
+        help="Only markets with an EV edge at or above this stay active. Set to 0 to just filter out negative-EV bets.",
+    )
+
+    ev_mode = st.selectbox(
+        "⚖️ EV basis (how the two engines are combined)", ["min", "mean", "max"], index=["min", "mean", "max"].index(E.EV_ENGINE_MODE),
+        key="ev_engine_mode",
+        format_func=lambda m: {
+            "min": "Both engines must agree (lower probability) - recommended",
+            "mean": "Average of the two engines",
+            "max": "Most generous engine (can show edges only one engine sees)",
+        }[m],
+        help="EV, fair odds, the confidence gate, Kelly and parlays all use this one probability. 'Lower' means the "
+             "edge shown is one that BOTH Dixon-Coles and Monte Carlo support. The 'EV (DC)' / 'EV (MC)' columns show each engine on its own.",
+    )
+    upload_meta = st.session_state.get("odds_upload_meta")
+    if upload_meta and tuple(upload_meta.get("fixture", ())) == (home_team, away_team):
+        # With a file in use, a market is priced only if the file priced it or you typed a price yourself; every other box still
+        # holds the 2.00 placeholder, which must not be mistaken for a real price (it would invent value signals).
+        applied = upload_meta["applied"]
+        priced = set(upload_meta["markets"]) | {m for m, v in edited_odds.items() if m not in applied and abs(v - 2.00) > 1e-9}
+        sheet_odds = {m: (v if m in priced else 0.0) for m, v in edited_odds.items()}
+        st.info(f"📥 Prices come from the uploaded file ({upload_meta['bookmaker']}, {upload_meta['price_type']}): {len(priced)} of "
+                f"{len(E.MARKET_LIST)} markets are priced. Markets without a price show ENTER ODDS and are left out of the filters and picks.")
+    else:
+        sheet_odds = edited_odds
+    sheet_rows = E.build_valuation_sheet(dc_probs, mc_probs, sheet_odds, vol_adjusted, ev_mode=ev_mode)
+    # Backtest reliability of each market, judged on the same probability the call uses (see the Backtester tab). Only used if the
+    # per-market backtest has been run for THIS league and data; otherwise the column says so. It is a warning, never a block.
+    market_signals = _recall_market_signals(division, settled_div, ev_mode)
+    trusted_verdicts = ("🟢 Reliable", "🟢 Probably real")
+    caution_rows = []
+    sheet_data = []
+    passing_rows = []
+    for r in sheet_rows:
+        confidence_pct = r.prob_used * 100
+        ev_pct = r.ev * 100
+        passes = E.passes_market_gate(confidence_pct, ev_pct, confidence_floor, min_ev_gate)
+        has_bet_call = r.bookmaker_odds > 0 and r.ev > 0 and r.convergence >= 0.5   # the sheet is offering a bet-type call (not Avoid / Low confidence)
+        sig = market_signals.get(r.market)
+        if not market_signals:
+            backtest_check = "not checked"
+        elif not sig:
+            backtest_check = "no track record"
+        elif has_bet_call and sig["verdict"] not in trusted_verdicts:
+            backtest_check = f"{sig['verdict']} ⚠ caution"
+            caution_rows.append((r.market, sig["verdict"]))
+        else:
+            backtest_check = sig["verdict"]
+        if passes:
+            passing_rows.append(r)
+        sheet_data.append({
+            "Market": r.market,
+            "Bookmaker Odds": r.bookmaker_odds,
+            "Dixon-Coles %": round(r.dc_prob * 100, 2),
+            "Monte Carlo %": round(r.mc_prob * 100, 2),
+            "Convergence %": round(r.convergence * 100, 1),
+            "Fair Odds": round(r.fair_odds, 2) if math.isfinite(r.fair_odds) else None,
+            "EV Edge %": round(ev_pct, 2),
+            "EV (DC) %": round(r.ev_dc * 100, 2) if math.isfinite(r.ev_dc) else None,
+            "EV (MC) %": round(r.ev_mc * 100, 2) if math.isfinite(r.ev_mc) else None,
+            "Volatility Tier": r.volatility_tier,
+            "Verdict": r.verdict,
+            "Recommended Action": r.recommended_action,
+            "Gate Status": E.market_gate_status(confidence_pct, ev_pct, confidence_floor, min_ev_gate),
+            "Calibration": (
+                market_calibrators[r.market].method if apply_calibration and r.market in market_calibrators else "off"
+            ),
+            "Backtest Check": backtest_check,
+            "_passes": passes,
+        })
+    sheet_df = pd.DataFrame(sheet_data)
+    display_df = sheet_df.drop(columns=["_passes"])
+
+    def _gate_row_style(row):
+        return [''] * len(row) if sheet_df.loc[row.name, "_passes"] else ['background-color: #2b2b2b; color: #808080'] * len(row)
+
+    if not market_signals:
+        st.caption("🧪 Backtest reliability check: not available yet. Run “🎯 Calculate accuracy for all markets” in the Backtester tab for this league "
+                   "and each market's reliability will show here (as a warning only).")
+    elif caution_rows:
+        st.warning(
+            f"⚠ {len(caution_rows)} market(s) show a bet-type call, but their backtest record is weak, so treat those calls with caution: "
+            + ", ".join(f"{m} ({v.split(' ', 1)[1]})" for m, v in caution_rows[:8]) + (" …" if len(caution_rows) > 8 else "")
+            + ". This is a warning only; nothing is blocked. The check judges the model's raw probabilities (before calibration) on past matches.")
+    st.dataframe(display_df.style.apply(_gate_row_style, axis=1), use_container_width=True, hide_index=True, height=560)
+    st.caption(f"✅ {len(passing_rows)} of {len(sheet_df)} markets currently allowed under your filters above.")
+
+    st.markdown("#### 🌍 Add to Multi-League Bet Slip")
+    st.caption(
+        "Unlike the single-match parlay below, this slip persists as you move between "
+        "different leagues and fixtures - build a combined ticket across several matches "
+        "at once from the '🌍 Multi-League Bet Slip' tab."
+    )
+    if not passing_rows:
+        st.caption("No markets currently pass your filters above to add.")
+    else:
+        add_market_choice = st.multiselect(
+            "Pick market(s) from this fixture to add",
+            [r.market for r in passing_rows], key="multi_slip_add_choice",
+        )
+        if st.button("➕ Add selected to Multi-League Slip", disabled=not add_market_choice):
+            existing_keys = {(leg["league"], leg["fixture"], leg["market"]) for leg in st.session_state.multi_bet_slip}
+            added = 0
+            for r in passing_rows:
+                if r.market not in add_market_choice:
+                    continue
+                key = (division, f"{home_team} vs {away_team}", r.market)
+                if key in existing_keys:
+                    continue
+                st.session_state.multi_bet_slip.append({
+                    "league": division, "fixture": f"{home_team} vs {away_team}",
+                    "market": r.market, "bookmaker_odds": r.bookmaker_odds,
+                    "dc_prob": r.dc_prob, "mc_prob": r.mc_prob, "ev": r.ev,
+                })
+                added += 1
+            if added:
+                st.success(f"✅ Added {added} leg(s) to the Multi-League Slip ({len(st.session_state.multi_bet_slip)} total).")
+            else:
+                st.info("Those legs are already in the slip.")
+
+    # --- Section 9: parlay & Kelly builder ---
+    render_parlay_builder(passing_rows, home_team, away_team, explanation)
+
+
+def render_parlay_builder(sheet_rows, home_team, away_team, explanation_text):
+    st.subheader("🎟️ Sisonke Multi-Leg Parlay & Kelly Slip Builder")
+    st.caption("Only markets currently passing your Confidence Floor and EV Gate above are offered here.")
+    row_by_market = {r.market: r for r in sheet_rows}
+    if len(row_by_market) < 2:
+        st.info(
+            "🚫 Fewer than 2 markets currently pass your filters, so there's nothing "
+            "safe to build a parlay from. Lower the Confidence Floor or EV Gate above "
+            "if you want more options."
+        )
+        return
+    chosen_markets = st.multiselect(
+        "Pick 2 or more qualifying value lines", list(row_by_market.keys()), key="parlay_legs"
+    )
+    if len(chosen_markets) < 2:
+        st.caption("Select at least 2 legs to build a parlay slip.")
+        return
+
+    legs = [row_by_market[m] for m in chosen_markets]
+    combined_odds, combined_prob = E.combine_parlay_legs(legs, st.session_state.get("ev_engine_mode", E.EV_ENGINE_MODE))
+    combined_ev = E.expected_value(combined_prob, combined_odds)
+
+    pc1, pc2, pc3 = st.columns(3)
+    pc1.metric("💰 Combined Odds", f"{combined_odds:.2f}")
+    pc2.metric("🎯 Joint Model Probability", f"{combined_prob * 100:.2f}%")
+    pc3.metric("📈 Combined EV", f"{combined_ev * 100:.2f}%")
+
+    kelly_mult = st.slider("🎚️ Fractional Kelly", 0.05, 1.00, 0.25, step=0.05, key="kelly_slider")
+    bankroll = st.number_input("💵 Matchday bankroll (R)", min_value=0.0, value=1000.0, step=50.0, key="bankroll")
+
+    if combined_ev <= 0:
+        st.error("🚫 Combined expected value is negative - staking locked out for safety.")
+        stake = 0.0
+    else:
+        kelly_frac = E.kelly_stake_fraction(combined_prob, combined_odds, kelly_mult)
+        raw_stake = kelly_frac * bankroll
+        stake = E.round_to_nearest(raw_stake, 10)
+        st.success(f"✅ Suggested stake: **R{stake:.0f}** (Kelly fraction: {kelly_frac * 100:.2f}%, rounded to nearest R10)")
+
+    ticket_lines = [
+        "SISONKE MULTI-LEG PARLAY SLIP", "=" * 40,
+        f"Fixture context: {home_team} vs {away_team}", "", "LEGS:",
+    ]
+    _ev_basis = st.session_state.get("ev_engine_mode", E.EV_ENGINE_MODE)
+    for r in legs:
+        _model_pct = E.consensus_prob(r.dc_prob, r.mc_prob, _ev_basis) * 100
+        ticket_lines.append(f"  - {r.market} @ {r.bookmaker_odds:.2f} (model {_model_pct:.1f}%, EV {r.ev * 100:.1f}%)")
+    ticket_lines += [
+        "", f"Combined Odds: {combined_odds:.2f}", f"Joint Model Probability: {combined_prob * 100:.2f}%",
+        f"Combined EV: {combined_ev * 100:.2f}%", f"Kelly Fraction Used: {kelly_mult:.2f}", f"Suggested Stake: R{stake:.0f}",
+    ]
+    ticket_text = "\n".join(ticket_lines)
+    dl1, dl2 = st.columns(2)
+    dl1.download_button("⬇️ Download Ticket (.txt)", data=ticket_text, file_name="sisonke_bet_slip.txt", mime="text/plain")
+
+    if dl2.button("📱 Send to Telegram", key="send_telegram_btn"):
+        token = st.session_state.get("tg_token", "")
+        chat_id = st.session_state.get("tg_chat_id", "")
+        message = f"{explanation_text}\n\n{ticket_text}"
+        ok, msg = E.send_telegram_message(token, chat_id, message)
+        if ok:
+            st.success(f"✅ {msg}")
+        else:
+            st.error(f"❌ {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Multi-League Bet Slip tab - like the single-fixture parlay builder above,
+# but legs persist as plain dicts across different fixtures/leagues, so you
+# can combine a pick from the EPL with one from the Bundesliga in the same
+# ticket instead of being limited to one match at a time.
+# ---------------------------------------------------------------------------
+def render_multi_league_slip():
+    st.subheader("🌍 Multi-League Bet Slip")
+    st.caption(
+        "Add legs here from the Active Projections Matrix tab ('➕ Add to Multi-League "
+        "Slip') across as many different leagues and fixtures as you like, then price "
+        "the combined ticket below."
+    )
+    slip = st.session_state.multi_bet_slip
+    if not slip:
+        st.info("Your slip is empty. Go to a fixture on the Active Projections Matrix tab and add some legs.")
+        return
+
+    slip_df = pd.DataFrame([
+        {
+            "League": leg["league"], "Fixture": leg["fixture"], "Market": leg["market"],
+            "Odds": leg["bookmaker_odds"], "Model %": round(E.consensus_prob(leg["dc_prob"], leg["mc_prob"], st.session_state.get("ev_engine_mode", E.EV_ENGINE_MODE)) * 100, 1),
+            "EV %": round(leg["ev"] * 100, 1),
+        }
+        for leg in slip
+    ])
+    st.dataframe(slip_df, use_container_width=True, hide_index=True)
+
+    leg_labels = [f"{leg['league']} | {leg['fixture']} | {leg['market']}" for leg in slip]
+    to_remove = st.multiselect("Remove specific leg(s)", leg_labels, key="multi_slip_remove_choice")
+    rc1, rc2 = st.columns(2)
+    if rc1.button("🗑️ Remove selected", disabled=not to_remove):
+        st.session_state.multi_bet_slip = [
+            leg for leg, label in zip(slip, leg_labels) if label not in to_remove
+        ]
+        st.rerun()
+    if rc2.button("🧹 Clear entire slip"):
+        st.session_state.multi_bet_slip = []
+        st.rerun()
+
+    if len(slip) < 2:
+        st.caption("Add at least 2 legs (from any league) to price a combined ticket.")
+        return
+
+    combined_odds, combined_prob = E.combine_parlay_legs(slip, st.session_state.get("ev_engine_mode", E.EV_ENGINE_MODE))
+    combined_ev = E.expected_value(combined_prob, combined_odds)
+
+    pc1, pc2, pc3 = st.columns(3)
+    pc1.metric("💰 Combined Odds", f"{combined_odds:.2f}")
+    pc2.metric("🎯 Joint Model Probability", f"{combined_prob * 100:.2f}%")
+    pc3.metric("📈 Combined EV", f"{combined_ev * 100:.2f}%")
+
+    kelly_mult = st.slider("🎚️ Fractional Kelly", 0.05, 1.00, 0.25, step=0.05, key="multi_slip_kelly_slider")
+    bankroll = st.number_input("💵 Matchday bankroll (R)", min_value=0.0, value=1000.0, step=50.0, key="multi_slip_bankroll")
+
+    if combined_ev <= 0:
+        st.error("🚫 Combined expected value is negative - staking locked out for safety.")
+        stake = 0.0
+    else:
+        kelly_frac = E.kelly_stake_fraction(combined_prob, combined_odds, kelly_mult)
+        raw_stake = kelly_frac * bankroll
+        stake = E.round_to_nearest(raw_stake, 10)
+        st.success(f"✅ Suggested stake: **R{stake:.0f}** (Kelly fraction: {kelly_frac * 100:.2f}%, rounded to nearest R10)")
+
+    ticket_lines = ["SISONKE MULTI-LEAGUE BET SLIP", "=" * 40, "LEGS:"]
+    _ev_basis = st.session_state.get("ev_engine_mode", E.EV_ENGINE_MODE)
+    for leg in slip:
+        _model_pct = E.consensus_prob(leg['dc_prob'], leg['mc_prob'], _ev_basis) * 100
+        ticket_lines.append(
+            f"  - [{leg['league']}] {leg['fixture']}: {leg['market']} @ {leg['bookmaker_odds']:.2f} "
+            f"(model {_model_pct:.1f}%, EV {leg['ev'] * 100:.1f}%)"
+        )
+    ticket_lines += [
+        "", f"Combined Odds: {combined_odds:.2f}", f"Joint Model Probability: {combined_prob * 100:.2f}%",
+        f"Combined EV: {combined_ev * 100:.2f}%", f"Kelly Fraction Used: {kelly_mult:.2f}", f"Suggested Stake: R{stake:.0f}",
+    ]
+    ticket_text = "\n".join(ticket_lines)
+    dl1, dl2 = st.columns(2)
+    dl1.download_button("⬇️ Download Ticket (.txt)", data=ticket_text, file_name="sisonke_multi_league_slip.txt", mime="text/plain", key="multi_slip_download")
+
+    if dl2.button("📱 Send to Telegram", key="multi_slip_send_telegram_btn"):
+        token = st.session_state.get("tg_token", "")
+        chat_id = st.session_state.get("tg_chat_id", "")
+        ok, msg = E.send_telegram_message(token, chat_id, ticket_text)
+        if ok:
+            st.success(f"✅ {msg}")
+        else:
+            st.error(f"❌ {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Live Standings Ledger tab
+# ---------------------------------------------------------------------------
+def render_standings_ledger():
+    division = st.selectbox("🏆 League workspace", divisions, key="standings_division")
+    division_df = working_df[working_df[division_col] == division]
+    settled_all, upcoming_all = E.split_played_unplayed(division_df)
+    # The file may hold many seasons. A league table, deserved points and a season forecast describe ONE season:
+    # add points across seasons and every number below would be wrong. (The model itself still learns from all of them.)
+    settled_div, upcoming_div, current_season_label, n_seasons_found = E.current_season_slice(settled_all, upcoming_all)
+    if n_seasons_found > 1:
+        st.info(f"🗓️ This file contains {n_seasons_found} seasons. The table, xPts and forecast below show the current season "
+                f"only (**{current_season_label}**); the prediction model still learns from every season.")
+
+    st.subheader("📋 Current League Table (real standings)")
+    if settled_div.empty:
+        st.caption("No settled matches yet for this division.")
+    else:
+        standings_table = E.compute_standings_table(settled_div)
+        st.dataframe(standings_table, use_container_width=True, hide_index=True)
+
+        with st.expander("📦 Archive & New-Season Prep"):
+            st.caption(
+                "This dataset doesn't track season boundaries on its own, so 'starting a new "
+                "season' here means: archive THIS final table under a season label before new "
+                "results start getting appended to the same division. The archived snapshot "
+                "stays retrievable afterward, even once the live table above reflects a mix of "
+                "old and new results - nothing about the underlying match data is touched or "
+                "deleted by archiving."
+            )
+            date_from = settled_div["date"].min()
+            date_to = settled_div["date"].max()
+
+            season_series, season_method = E.derive_season_series(settled_div)
+            if not season_series.empty and settled_div["date"].notna().any():
+                suggested_label = season_series.loc[settled_div["date"].idxmax()]
+            elif not season_series.empty:
+                suggested_label = season_series.iloc[-1]
+            else:
+                suggested_label = "season-1"
+            method_note = {
+                "column": "detected an explicit season column in this data - using it directly",
+                "inferred": "no season column found - inferred from match dates (Aug-June convention)",
+                "fallback": "no season column or usable dates found - defaulting to a single label",
+            }[season_method]
+            st.caption(f"🗓️ Suggested label source: {method_note}.")
+
+            arch_col1, arch_col2 = st.columns([2, 1])
+            season_label = arch_col1.text_input("Season label for this snapshot", value=str(suggested_label), key="season_label_input")
+            if arch_col2.button("📥 Archive current table", key="archive_standings_btn"):
+                archive_standings_snapshot(division, season_label, standings_table, settled_div)
+                st.success(f"✅ Archived '{season_label}' - {len(standings_table)} teams, {len(settled_div)} matches ({date_from.date()} to {date_to.date()}).")
+
+            archived = list_archived_seasons(division)
+            if archived:
+                st.markdown("**Previously archived seasons for this division:**")
+                pick = st.selectbox("View an archived season", sorted(archived.keys(), reverse=True), key="archived_season_pick")
+                snap = archived[pick]
+                st.caption(
+                    f"{snap['n_matches']} matches, {snap['date_from']} to {snap['date_to']} "
+                    f"(archived {snap['archived_at']})"
+                )
+                st.dataframe(pd.DataFrame(snap["standings"]), use_container_width=True, hide_index=True)
+                if st.button(f"🗑️ Delete '{pick}' archive", key="delete_archived_season_btn"):
+                    delete_archived_season(division, pick)
+                    st.rerun()
+            else:
+                st.caption("No archived seasons yet for this division.")
+
+    st.subheader("📊 Deserved Points Table (xPts)")
+    st.caption("Sorted by real (actual) points, highest first.")
+    if settled_div.empty:
+        st.caption("No settled matches yet for this division.")
+    else:
+        xpts_table = E.compute_xpts_table(settled_div)
+        display_cols = ["team", "played", "wins", "draws", "losses", "goal_difference",
+                         "actual_points", "expected_points", "points_difference"]
+        st.dataframe(xpts_table[display_cols], use_container_width=True, hide_index=True)
+
+    st.subheader("🔮 10,000-Run Season Forecast")
+    if upcoming_div.empty:
+        st.caption("No remaining fixtures to simulate - season looks complete in this dataset.")
+        return
+
+    all_teams_here = sorted(pd.unique(pd.concat([settled_div[["home_team", "away_team"]], upcoming_div[["home_team", "away_team"]]]).values.ravel("K")))
+    all_teams_here = [t for t in all_teams_here if isinstance(t, str)]
+    with st.expander("💰 Title odds input (optional - adds an Edge column)"):
+        title_odds_input = {}
+        odd_cols = st.columns(3)
+        for i, t in enumerate(all_teams_here):
+            val = odd_cols[i % 3].number_input(f"{t} title odds", min_value=0.0, value=0.0, step=1.0, key=f"title_odds_{t}")
+            if val > 0:
+                title_odds_input[t] = val
+        st.session_state.title_odds = title_odds_input
+
+    if st.button("▶️ Run 10,000-iteration season simulation", key="run_season_sim"):
+        with st.spinner("Simulating 10,000 seasons..."):
+            _cfg = current_engine_config(division)
+            forecast = E.simulate_season(
+                settled_all, upcoming_div, iterations=E.MC_ITERATIONS, title_odds=st.session_state.title_odds,
+                weights=current_territory_weights(division), points_df=settled_div,
+                engine_weights=_cfg["weights"], duel_strength=_cfg["duel_strength"],
+                mismatch_table=cached_mismatch_table(division), mismatch_strength=_cfg["mismatch_strength"],
+            )
+        st.session_state["season_forecast"] = forecast
+
+    if "season_forecast" in st.session_state:
+        forecast = st.session_state["season_forecast"]
+        core_cols = ["team", "current_points", "title_win_pct", "relegation_risk_pct", "relegation_flag"]
+        if "title_odds" in forecast.columns:
+            core_cols += ["title_odds", "title_edge_pct"]
+        st.caption("Sorted by current real points, highest first.")
+        st.dataframe(forecast[core_cols], use_container_width=True, hide_index=True)
+
+        with st.expander("📍 Detailed finishing-position distribution (% chance of each exact position)"):
+            pos_cols = [c for c in forecast.columns if c.startswith("finish_pos_")]
+            pos_display = forecast[["team"] + pos_cols].copy()
+            pos_display.columns = ["team"] + [f"P{c.split('_')[-1]}" for c in pos_cols]
+            st.dataframe(pos_display, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Performance Backtester tab
+# ---------------------------------------------------------------------------
+def render_backtester():
+    division = st.selectbox("🏆 League workspace", divisions, key="backtest_division")
+    division_df = working_df[working_df[division_col] == division]
+    settled_div, _ = E.split_played_unplayed(division_df)
+    if settled_div.empty:
+        st.caption("No settled matches for this division.")
+        return
+
+    st.subheader("🎛️ Backtest Controls")
+    enable_manual_override = st.checkbox(
+        "🔓 Enable manual override (special cases only - leave OFF for normal use)",
+        value=False, key="enable_manual_override",
+        help="This is a what-if sensitivity check, never the model's main calibrator. Auto-calibrated "
+             "half-life + real fitted probabilities are what actually drive predictions - this slider only "
+             "nudges the BACKTEST comparison and does nothing unless explicitly turned on here.",
+    )
+    bc1, bc2 = st.columns(2)
+    manual_override_pct = bc1.slider(
+        "🎚️ Manual Override (shift Home Win probability, percentage points)",
+        -20.0, 20.0, 0.0, step=1.0, key="manual_override_slider",
+        disabled=not enable_manual_override,
+        help="Nudges every backtest prediction's Home Win probability by this many points (rebalancing Draw/Away proportionally) - a sensitivity check, not a permanent model change.",
+    )
+    accuracy_floor = bc2.slider(
+        "📏 Accuracy Floor (%) - only count high-confidence picks", 0, 100, 0, step=5, key="accuracy_floor_slider",
+        help="Filters the accuracy metric to only predictions where the model's top pick exceeded this probability - shows how good the model is when it's genuinely confident.",
+    )
+
+    half_life_choice = st.radio(
+        "Half-life used for this backtest", ["Auto-optimised", "Frozen 45-day", "Effectively no decay (raw/unweighted)"],
+        horizontal=True, key="backtest_hl_choice",
+    )
+    territory_weights_bt = st.session_state.get("territory_weights_by_league", {}).get(division, E.TERRITORY_WEIGHTS_DEFAULT)
+    if half_life_choice == "Frozen 45-day":
+        hl_for_backtest = E.FROZEN_HALF_LIFE_DAYS
+    elif half_life_choice == "Effectively no decay (raw/unweighted)":
+        hl_for_backtest = 100_000.0
+    else:
+        hl_for_backtest = known_half_life(division, settled_div)  # None = not searched yet (searching is part of the run below)
+
+    with st.expander("🧮 Compare rating methods: Standard vs Opponent-adjusted (smoothed)"):
+        st.caption(
+            "Runs the same walk-forward backtest twice on this league, scoring the same matches, once with each rating method, and compares "
+            "the 1X2 results. Only the territorial ratings differ; everything else is identical. A BSS difference under about 0.01 is within "
+            "noise, so treat the winner as real only if it is clearly larger, and check it on several leagues before switching.")
+        if hl_for_backtest is None:
+            st.caption("Run this league's backtest below once first, so its half-life is known.")
+        else:
+            cmp_key = (division, len(settled_div), _data_fingerprint(settled_div), E.ENGINE_VERSION, backtest_max_evaluated(), hl_for_backtest,
+                       float(st.session_state.get("opp_shrink_k", 6.0)), float(st.session_state.get("opp_venue_k", 8.0)))
+            if st.button(f"▶ Compare methods on {division}", key=f"cmp_methods_btn_{division}"):
+                keep = dict(E.OPP_ADJUST)
+                rows = []
+                try:
+                    with st.spinner("Running both backtests (this takes about twice a normal backtest)..."):
+                        for label, on in (("Standard", False), ("Opponent-adjusted (smoothed)", True)):
+                            E.set_opponent_adjustment(on, float(st.session_state.get("opp_shrink_k", 6.0)), float(st.session_state.get("opp_venue_k", 8.0)))
+                            bt_cmp = E.walk_forward_backtest(settled_div, half_life_days=hl_for_backtest, weights=territory_weights_bt,
+                                                             include_all_markets=False, **current_backtest_kwargs(division))
+                            rows.append({"Method": label, "Matches scored": len(bt_cmp), "1X2 BSS": round(E.brier_skill_score(bt_cmp), 4),
+                                         "1X2 Brier": round(E.multiclass_brier_score(bt_cmp), 4),
+                                         "Top-pick accuracy %": round(float(bt_cmp["correct"].mean()) * 100, 1)})
+                finally:
+                    E.set_opponent_adjustment(keep["enabled"], keep["shrink_k"], keep["venue_k"])
+                st.session_state["_rating_cmp"] = (cmp_key, rows)
+            saved_cmp = st.session_state.get("_rating_cmp")
+            if saved_cmp and saved_cmp[0] == cmp_key:
+                st.dataframe(pd.DataFrame(saved_cmp[1]), use_container_width=True, hide_index=True)
+                delta = saved_cmp[1][1]["1X2 BSS"] - saved_cmp[1][0]["1X2 BSS"]
+                if delta >= 0.01:
+                    st.success(f"Opponent-adjusted is ahead by {delta:+.4f} BSS: larger than the usual noise. Worth confirming on other leagues.")
+                elif delta <= -0.01:
+                    st.warning(f"Standard is ahead by {-delta:.4f} BSS: keep the standard method for this league.")
+                else:
+                    st.info(f"Difference {delta:+.4f} BSS is within noise: no evidence either method is better here. Prefer Standard (simpler).")
+
+    # The backtests are the slowest thing in the app, so they run only when asked - unless every result this tab needs
+    # is already computed (by you earlier, or by anyone else using the app since it last restarted), in which case it
+    # just appears.
+    comparison_kwargs = [
+        dict(half_life_days=100_000.0, full_model=False, max_evaluated=backtest_max_evaluated()),
+        dict(half_life_days=E.FROZEN_HALF_LIFE_DAYS, full_model=False, max_evaluated=backtest_max_evaluated()),
+    ]
+    main_ready = hl_for_backtest is not None and wf_is_cached(
+        division, settled_div, half_life_days=hl_for_backtest, weights=territory_weights_bt, **current_backtest_kwargs(division))
+    everything_cached = main_ready and all(wf_is_cached(division, settled_div, **kw) for kw in comparison_kwargs)
+    run_flag = f"run_backtester::{division}"
+    if not everything_cached and not st.session_state.get(run_flag):
+        st.info(
+            f"📅 The backtest for {division} ({len(settled_div)} settled matches) is not run automatically: it replays the "
+            "whole league match by match with the full model, which takes a few minutes the first time. Once finished it is "
+            "kept for everyone using the app until the app restarts, so the next visit is instant."
+        )
+        if st.button(f"▶ Run backtest for {division}", type="primary", key=f"run_backtest_btn_{division}"):
+            st.session_state[run_flag] = True
+            st.rerun()
+        return
+    if hl_for_backtest is None:
+        with st.spinner("Finding this league's best half-life first..."):
+            hl_for_backtest, _ = cached_half_life(division, settled_div)
+
+    with st.spinner(f"Running a walk-forward backtest across all {len(settled_div)} settled matches..."):
+        backtest_df = cached_walk_forward(division, settled_div, half_life_days=hl_for_backtest, weights=territory_weights_bt,
+                                              **current_backtest_kwargs(division))
+    if territory_weights_bt != E.TERRITORY_WEIGHTS_DEFAULT:
+        st.caption(
+            f"Using this league's calibrated territory weights "
+            f"(Big Chances {territory_weights_bt[0]*100:.0f}% / SOT {territory_weights_bt[1]*100:.0f}% / "
+            f"Box Touches {territory_weights_bt[2]*100:.0f}%) - calibrate or reset from the Active "
+            "Projections Matrix tab."
+        )
+
+    if backtest_df.empty:
+        st.warning("Not enough history yet to backtest (need several settled matches before the first prediction can be made).")
+        return
+
+    if enable_manual_override and manual_override_pct != 0:
+        adjusted = backtest_df.copy()
+        for i, row in adjusted.iterrows():
+            ph, pd_, pa = E.apply_manual_override(row["p_home"], row["p_draw"], row["p_away"], manual_override_pct)
+            adjusted.at[i, "p_home"], adjusted.at[i, "p_draw"], adjusted.at[i, "p_away"] = ph, pd_, pa
+            adjusted.at[i, "predicted_pick"] = max([("H", ph), ("D", pd_), ("A", pa)], key=lambda kv: kv[1])[0]
+            adjusted.at[i, "correct"] = adjusted.at[i, "predicted_pick"] == row["actual"]
+        backtest_df = adjusted
+
+    bss = E.brier_skill_score(backtest_df)
+    accuracy = E.backtest_accuracy_pct(backtest_df)
+    confident_mask = backtest_df[["p_home", "p_draw", "p_away"]].max(axis=1) * 100 >= accuracy_floor
+    filtered_df = backtest_df[confident_mask]
+    filtered_accuracy = E.backtest_accuracy_pct(filtered_df) if not filtered_df.empty else float("nan")
+
+    st.subheader("📐 Model Skill Metrics (whole dataset)")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🎯 Brier Skill Score", f"{bss:.3f}" if not math.isnan(bss) else "n/a", help=">0 beats naive guessing, <0 is worse than it")
+    m2.metric("✅ Accuracy (all picks)", f"{accuracy:.1f}%" if not math.isnan(accuracy) else "n/a")
+    m3.metric(f"🔎 Accuracy (≥{accuracy_floor}% confidence)", f"{filtered_accuracy:.1f}%" if not math.isnan(filtered_accuracy) else "n/a")
+    m4.metric("📊 Matches backtested", len(backtest_df))
+    st.caption(
+        f"🔢 Sample size behind the numbers above: **{len(backtest_df)}** predictions in "
+        f"'all picks', **{len(filtered_df)}** of those cleared the ≥{accuracy_floor}% "
+        f"confidence floor for 'gated' accuracy."
+    )
+
+    st.subheader("📈 Weighted vs Raw Comparison")
+    st.caption("Fast territorial-only comparison of the two decay settings (it isolates the effect of time-weighting; "
+               "the full model - engine blend, duel, momentum, tactical mismatch - is what the backtest above runs).")
+    raw_backtest = cached_walk_forward(division, settled_div, half_life_days=100_000.0, full_model=False, max_evaluated=backtest_max_evaluated())
+    weighted_backtest = cached_walk_forward(division, settled_div, half_life_days=E.FROZEN_HALF_LIFE_DAYS, full_model=False, max_evaluated=backtest_max_evaluated())
+    compare_df = pd.DataFrame({
+        "Accuracy %": [E.backtest_accuracy_pct(raw_backtest), E.backtest_accuracy_pct(weighted_backtest)],
+        "Brier Skill Score": [E.brier_skill_score(raw_backtest), E.brier_skill_score(weighted_backtest)],
+    }, index=["Raw (no decay)", "Weighted (45-day half-life)"])
+    st.bar_chart(compare_df[["Accuracy %"]])
+    st.dataframe(compare_df, use_container_width=True)
+
+    st.subheader("📅 Full Backtest Log (whole dataset)")
+    st.dataframe(
+        backtest_df[["date", "home_team", "away_team", "home_goals", "away_goals", "goal_difference",
+                     "p_home", "p_draw", "p_away", "actual", "predicted_pick", "correct"]],
+        use_container_width=True, hide_index=True, height=400,
+    )
+
+    st.subheader("🎯 Accuracy % for All 22 Markets")
+    st.caption(
+        "The accuracy shown above (and in the 'Full Backtest Log' actual/predicted_pick "
+        "columns) only measures the outright 1X2 pick - whichever of Home/Draw/Away had the "
+        "single highest probability. This section is a different, complementary question: "
+        f"for EACH of the {N_MARKETS} markets as its own standalone bet, how often was the model's own "
+        "≥50%-confidence side actually correct? These two numbers can legitimately differ - "
+        "e.g. a match where Home Win was the highest of the three outcomes at 45% (so "
+        "predicted_pick='H') but didn't itself clear 50% would count as 'wrong' for the "
+        "standalone Home Win market here, even though it was still the outright top pick above."
+    )
+    if st.button(f"🎯 Calculate accuracy for all {N_MARKETS} markets (re-runs the backtest - may take longer)"):
+        with st.spinner(f"Re-running the walk-forward backtest with all {N_MARKETS} markets..."):
+            full_backtest_df = cached_walk_forward(
+                division, settled_div, half_life_days=hl_for_backtest, weights=territory_weights_bt,
+                include_all_markets=True, **current_backtest_kwargs(division),
+            )
+            _remember_market_backtest(division, settled_div, full_backtest_df)
+            st.session_state["_market_signal_memo"] = {}   # re-read the live sheet's reliability statuses from this new backtest
+    full_backtest_df = _recall_market_backtest(division, settled_div)   # every league keeps its own; shows again automatically when you return
+    if full_backtest_df is not None and not full_backtest_df.empty:
+        per_market_confidence_floor = st.slider(
+            "🎚️ Confidence level (50 = each market's own normal call level; rare markets get a lower bar)",
+            0, 100, 0, step=5, key="per_market_accuracy_floor",
+            help="0 = every settled match counts for every market (N will be identical across "
+                 f"all {N_MARKETS} rows). Raise it to count only the model's confident calls. The level is "
+                 "SCALED per market: 50 means 'at that market's own call level' (the 'Call level %' column) - "
+                 "50% where the model is often that confident, but much lower for a rare market such as an exact score, which "
+                 "essentially never reaches 50%. 75 keeps roughly the market's top 11% most confident matches and 100 its top 2%. 'Happened %' always stays the market's "
+                 "frequency over ALL matches, so 'Lift on calls ×' stays a real comparison at every setting: at 0 and at 50 "
+                 "you see the same calls; above 50 only the model's most confident calls count, so 'Calls' shrinks and "
+                 "'Call level %' rises - if the model's confidence is meaningful, the hit rate and lift rise with it. "
+                 "Once 'Calls' falls below about 50, treat the hit rate as noise.",
+        )
+        per_market_accuracy = E.per_market_backtest_accuracy(
+            full_backtest_df, min_confidence_pct=per_market_confidence_floor, ev_mode=st.session_state.get("ev_engine_mode", E.EV_ENGINE_MODE))
+        market_acc_df = pd.DataFrame([
+            {"Market": m, "Accuracy %": v["accuracy_pct"], "N (sample size)": v["n"],
+             "Happened %": v["happened_pct"], "Call level %": v["call_level_pct"], "Calls": v["n_calls"],
+             "Hit rate on calls %": v["call_hit_rate_pct"], "Lift on calls ×": v["lift_on_calls"],
+             "Chance it's luck %": v["luck_pct"], "Verdict": v["verdict"], "Recommendation": v["advice"]}
+            for m, v in per_market_accuracy.items()
+        ]).sort_values("Accuracy %", ascending=False)
+        st.dataframe(market_acc_df, use_container_width=True, hide_index=True)
+        st.caption(
+            "N is how many backtested matches actually count toward that row's accuracy % - "
+            "at 0% confidence floor this is the same for every market (the full backtest "
+            "length); above 0% it will genuinely differ market to market, since some markets "
+            "clear high confidence far more often than others. A high accuracy % sitting on a "
+            "small N is worth treating with more caution than the same accuracy % on a large one. "
+            "HOW TO READ THE EXTRA COLUMNS: 'Accuracy %' counts a market as right whenever the model's call at 50% or more "
+            "matches what happened, so a market the model never backs still scores high just because it rarely occurs. "
+            "'Happened %' is how often the outcome actually occurred. 'Call level %' is the probability at which the model "
+            "counts as genuinely BACKING that market: 50% where the model is often that confident, and for rarer markets the level its own top 20% most confident matches reach. "
+            "'Calls' is how many times it reached that level, 'Hit rate on calls %' is how "
+            "often it happened when it did, and 'Lift on calls ×' is that hit rate divided by 'Happened %' - above 1.0 means the "
+            "model's calls beat the market's normal frequency. A market with 0 calls has no real track record, whatever its "
+            "accuracy % (a 98% accuracy on a market that happens 2% of the time is no skill at all). "
+            "'Chance it's luck %' is the probability of hitting this well or better on its calls if the model had no skill at all "
+            "(an exact binomial test against 'Happened %'). 'Verdict' and 'Recommendation' turn that into a call: Reliable (under about 0.1% luck) and Probably real (under about 2%) "
+            "need 50+ calls, Weak signal is under 16%, anything else is Noise, a real but tiny edge (lift under 1.10) is flagged as such, and under 30 calls is too few to judge. The bar is deliberately strict "
+            "because many markets are tested at once and a few will look good by chance. The verdict judges the model's probabilities only: "
+            "a bet still needs an edge over the bookmaker's price in the live valuation. "
+            "SAME PROBABILITY AS THE LIVE CALL: every figure in this table is computed on the probability the live valuation sheet acts on "
+            "(by default the lower of Dixon-Coles and Monte Carlo, following the 'EV basis' setting there), before calibration. "
+            "NO LOOK-AHEAD: each backtested match is predicted only from matches on EARLIER dates, with the same automatic steps as live "
+            "(fixture congestion, style matchup, Freeze Decay). What cannot be mirrored: your manual situational toggles, "
+            "and the half-life and weights, which were tuned on this same history."
+        )
+        st.bar_chart(market_acc_df.set_index("Market")["Accuracy %"])
+    else:
+        st.caption("Click the button above to compute this (not run automatically, since it's more expensive).")
+
+    st.subheader("🎰 Odds Calibration: what does a price actually mean here?")
+    st.caption(
+        "This uses ONLY the model's own historical predictions - no real bookmaker odds "
+        "needed. Every walk-forward pick has an implied price (1 / probability): odds "
+        "around 2.00 imply a 50% chance, 3.00 implies 33%, and so on. This groups every "
+        "historical pick by that implied price band and checks how often the picked side "
+        "ACTUALLY won within each band. A well-calibrated model's Actual Win Rate should "
+        "land close to its Model-Implied Win Rate in every row - a consistently positive "
+        "or negative Calibration Gap means the model is over- or under-confident at that "
+        "price range specifically."
+    )
+    calibration_table = E.odds_calibration_table(backtest_df)
+    if calibration_table.empty:
+        st.caption("Not enough backtest predictions yet to build calibration bands.")
+    else:
+        st.dataframe(calibration_table, use_container_width=True, hide_index=True)
+
+    st.subheader("🎯 Calibration: Platt vs. Isotonic vs. No Correction")
+    st.caption(
+        "Fits BOTH Platt scaling and isotonic regression on this same backtest sweep for "
+        "EVERY market (not just Home/Draw/Away), scores both via 5-fold cross-validation "
+        "(never on the rows used to fit), and keeps whichever wins on held-out log-loss - "
+        "'none' wins if the raw probabilities were already fine, so a calibration correction "
+        "is never force-fit to noise. This is what actually gets applied automatically on the "
+        f"Active Projections Matrix tab, for every one of the {N_MARKETS} markets, before any prediction "
+        "reaches the valuation sheet."
+    )
+    if full_backtest_df is not None and not full_backtest_df.empty:
+        backtest_calibrators = E.fit_all_market_calibrators(full_backtest_df)
+        calibration_summary_df = E.all_market_calibration_summary_table(backtest_calibrators)
+        st.dataframe(calibration_summary_df, use_container_width=True, hide_index=True)
+        st.caption(
+            f"Method distribution across all {len(calibration_summary_df)} markets: "
+            + ", ".join(f"{k} × {v}" for k, v in calibration_summary_df["Method Selected"].value_counts().items())
+        )
+    else:
+        st.caption(
+            f"Showing Home/Draw/Away only - click 'Calculate accuracy for all {N_MARKETS} markets' above "
+            "first to see calibration for every market (Draw No Bet, Multi Score, Over/Under, "
+            "BTTS, etc.), since that's the same full backtest sweep this needs."
+        )
+        backtest_calibrators = E.fit_1x2_calibrators(backtest_df)
+        calibration_summary_df = E.calibration_summary_table(backtest_calibrators)
+        st.dataframe(calibration_summary_df, use_container_width=True, hide_index=True)
+
+    st.subheader("🔢 Sample Sizes Behind Every Percentage on This Tab")
+    st.caption(
+        "Every accuracy/calibration number above is only as trustworthy as the N behind it - "
+        "this pulls all of them into one place so a strong-looking percentage on a thin sample "
+        "is never mistaken for one backed by real volume."
+    )
+    sample_size_rows = [
+        {"Metric": "Overall accuracy (all picks)", "N": len(backtest_df), "Note": "Every backtested match, unfiltered"},
+        {"Metric": f"Overall accuracy (≥{accuracy_floor}% confidence)", "N": len(filtered_df), "Note": f"{len(filtered_df)}/{len(backtest_df)} cleared the confidence floor slider above"},
+        {"Metric": "Brier Skill Score", "N": len(backtest_df), "Note": "Computed across the same full backtest"},
+    ]
+    if full_backtest_df is not None and not full_backtest_df.empty:
+        per_market_n = E.per_market_backtest_accuracy(full_backtest_df, min_confidence_pct=0)
+        n_values = sorted({v["n"] for v in per_market_n.values()})
+        sample_size_rows.append({
+            "Metric": f"Per-market accuracy ({N_MARKETS} markets, 0% floor)",
+            "N": n_values[0] if len(n_values) == 1 else f"{min(n_values)}-{max(n_values)}",
+            "Note": "Same N for every market at 0% floor - use the slider in that section to see N diverge per market",
+        })
+    else:
+        sample_size_rows.append({
+            "Metric": f"Per-market accuracy ({N_MARKETS} markets)", "N": "n/a",
+            "Note": f"Click 'Calculate accuracy for all {N_MARKETS} markets' above to populate this",
+        })
+    if not calibration_table.empty:
+        for _, r in calibration_table.iterrows():
+            sample_size_rows.append({
+                "Metric": f"Odds calibration band {r['Odds Band']}", "N": r["Predictions"],
+                "Note": "From the Odds Calibration table above",
+            })
+    label_col = "Market" if "Market" in calibration_summary_df.columns else "Outcome"
+    calibration_rows_to_check = list(calibration_summary_df[label_col]) if label_col == "Market" else ["Home Win", "Draw", "Away Win"]
+    for cls_label in calibration_rows_to_check:
+        match = calibration_summary_df[calibration_summary_df[label_col] == cls_label]
+        if not match.empty:
+            sample_size_rows.append({
+                "Metric": f"Calibration - {cls_label}", "N": int(match.iloc[0]["N (backtest rows)"]),
+                "Note": f"Method selected: {match.iloc[0]['Method Selected']}",
+            })
+    st.dataframe(pd.DataFrame(sample_size_rows), use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Full Database View tab
+# ---------------------------------------------------------------------------
+def render_full_database():
+    st.subheader("📑 Full Database View")
+    st.caption(f"{len(st.session_state.raw_db)} row(s), as originally uploaded (team-name casing already normalised).")
+
+    display_df = working_df.copy()
+    if "home_goals" in display_df.columns and "away_goals" in display_df.columns:
+        display_df["goal_difference"] = display_df["home_goals"] - display_df["away_goals"]
+
+    if all(c in display_df.columns for c in ["home_big_chances", "away_big_chances", "home_shots_on_target", "away_shots_on_target", "home_box_touches", "away_box_touches"]):
+        display_df["home_implied_xg"] = (
+            0.55 * display_df["home_big_chances"] * 0.36
+            + 0.35 * display_df["home_shots_on_target"] * 0.11
+            + 0.10 * display_df["home_box_touches"] * 0.015
+        ).round(2)
+        display_df["away_implied_xg"] = (
+            0.55 * display_df["away_big_chances"] * 0.36
+            + 0.35 * display_df["away_shots_on_target"] * 0.11
+            + 0.10 * display_df["away_box_touches"] * 0.015
+        ).round(2)
+        st.caption("ℹ️ `*_implied_xg` is blank when any of that match's three stats is missing (never counted as 0), and is a lightweight per-match estimate from THAT match's own registered stats (not the full team-strength model) - for a quick eyeball check, not a substitute for the Projections Matrix.")
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True, height=600)
+
+
+# ---------------------------------------------------------------------------
+# Forward Test tab: the model's PREDICTIONS (not its calls) against what actually happened, last 30 days
+# ---------------------------------------------------------------------------
+FORWARD_LOG_FILE = DATA_DIR / "forward_predictions_log.json"
+FWD_KEY_MARKETS = ["Home Win", "Draw", "Away Win", "Double Chance 12", "Double Chance 1X", "Double Chance X2", "Over 1.5 Goals",
+                   "Over 2.5 Goals", "Under 2.5 Goals", "Over 3.5 Goals", "BTTS - Yes", "BTTS - No"]
+
+
+def load_forward_log() -> list:
+    try:
+        if FORWARD_LOG_FILE.exists():
+            data = json.loads(FORWARD_LOG_FILE.read_text())
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+
+def save_forward_log(records: list):
+    _atomic_write_json(records, FORWARD_LOG_FILE)
+
+
+def _fwd_key(r: dict) -> tuple:
+    return (r["division"], str(r["fixture_date"])[:10], r["home_team"], r["away_team"])
+
+
+def _forward_params(div: str, settled_d, allow_search: bool):
+    """The same per-league settings the live sheet uses (half-life, weights, engine config, learned style table). None if the league
+    has no known half-life yet and a search is not allowed here."""
+    frozen = bool(st.session_state.get("freeze_decay", False))
+    cached = get_cached_league_params(div, len(settled_d), half_life_frozen=frozen)
+    cfg = current_engine_config(div)
+    if frozen:
+        hl = E.FROZEN_HALF_LIFE_DAYS
+    else:
+        hl = cached["half_life_days"] if cached else known_half_life(div, settled_d)
+        if hl is None and allow_search:
+            hl, _ = cached_half_life(div, settled_d)
+    if hl is None:
+        return None
+    table = E.deserialize_mismatch_table(cached.get("mismatch_table", {})) if cached else {}
+    return dict(hl=hl, use_idx=frozen, cfg=cfg, wts=current_territory_weights(div), table=table, calibrated=bool(cached))
+
+
+def _fwd_cell(p, happened) -> str:
+    if p is None:
+        return ""
+    if happened is None or (isinstance(happened, float) and pd.isna(happened)):
+        return f"{p * 100:.0f}%  (void)"
+    return f"{p * 100:.0f}%  " + ("✅" if ((p >= 0.5) == bool(happened)) else "❌")
+
+
+def _fwd_replay(div: str, settled_d, ev_mode: str):
+    """Walk-forward replay of the last 30 days of this league: each match predicted only from earlier dates, exactly as in the backtest.
+    Not logged live, so it is NOT a true forward test (the half-life and weights were tuned on this history), but it is available at once."""
+    p = _forward_params(div, settled_d, allow_search=False)
+    if p is None:
+        return None, "no half-life known yet: open this league once in the Active Projections Matrix tab"
+    last = settled_d["date"].max()
+    start = last - pd.Timedelta(days=29)
+    n30 = int((settled_d["date"] >= start).sum())
+    bt = E.walk_forward_backtest(
+        settled_d, half_life_days=p["hl"], weights=p["wts"], include_all_markets=True, mc_iterations=1500,
+        engine_weights=p["cfg"]["weights"], duel_strength=p["cfg"]["duel_strength"], mismatch_strength=p["cfg"]["mismatch_strength"],
+        max_evaluated=max(n30 + 100, 150), use_match_index=p["use_idx"])   # the extra matches only warm up the learned style factor
+    bt = E._with_consensus_probs(bt, ev_mode)
+    bt = bt[bt["date"] >= start]
+    rows = []
+    for r in bt.to_dict("records"):
+        probs = {m: float(r[f"prob__{m}"]) for m in E.MARKET_LIST if pd.notna(r.get(f"prob__{m}"))}
+        outs = {m: (None if pd.isna(r.get(f"actual__{m}")) else bool(r[f"actual__{m}"])) for m in E.MARKET_LIST if f"actual__{m}" in r}
+        rows.append(dict(division=div, fixture_date=str(pd.Timestamp(r["date"]).date()), home_team=r["home_team"], away_team=r["away_team"],
+                         logged_at=None, source="replay", params_note="", probs=probs, status="played", home_goals=int(r["home_goals"]),
+                         away_goals=int(r["away_goals"]), outcomes=outs, logged_before_match_day=True))
+    return pd.DataFrame(rows), ""
+
+
+def _fwd_summary_row(div: str, scored, settled_d) -> dict:
+    played = scored[scored["status"] == "played"] if len(scored) else scored
+    res = settled_d[["home_goals", "away_goals"]].dropna()
+    clim = ((res.home_goals > res.away_goals).mean(), (res.home_goals == res.away_goals).mean(), (res.home_goals < res.away_goals).mean()) if len(res) else None
+    s = E.forward_1x2_summary(scored, clim)
+    mt = E.forward_market_table(scored, ["Over 2.5 Goals", "BTTS - Yes", "Double Chance 12"]) if len(played) else pd.DataFrame()
+    get = lambda m: (mt.loc[mt["Market"] == m, "Accuracy % (>=50% rule)"].iloc[0] if (len(mt) and (mt["Market"] == m).any()) else None)
+    return {"League": div, "Predictions": len(scored), "Played": len(played), "Awaiting result": len(scored) - len(played),
+            "1X2 top pick %": None if not s.get("n") else round(s["top_pick_accuracy"] * 100, 1),
+            "1X2 BSS": None if not s.get("n") or "bss" not in s else round(s["bss"], 3),
+            "Over 2.5 % (≥50% rule)": get("Over 2.5 Goals"), "BTTS Yes % (≥50% rule)": get("BTTS - Yes"), "12 % (≥50% rule)": get("Double Chance 12")}
+
+
+def render_forward_test():
+    st.subheader("🧪 Forward Test: predictions vs outcomes, last 30 days")
+    st.caption(
+        "Judged on the model's PREDICTIONS only (its probabilities), never on odds or on whether a bet was recommended. Two rules are shown: the "
+        "**1X2 top pick** (the most likely of Home/Draw/Away) and the **strict ≥50% rule** per market (the model's side counts as a prediction only "
+        "when it reaches 50%). These are the raw model's numbers: no manual toggles, no odds, no calibration.")
+    ev_mode = st.session_state.get("ev_engine_mode", E.EV_ENGINE_MODE)
+    if "_fwd_log" not in st.session_state:
+        st.session_state["_fwd_log"] = load_forward_log()
+    log = st.session_state["_fwd_log"]
+    division = st.selectbox("🏆 League", divisions, key="fwd_division")
+    d_df = working_df[working_df[division_col] == division]
+    settled_d, upcoming_d = E.split_played_unplayed(d_df)
+    mode = st.radio("Source", ["📌 Logged predictions (true forward test)", "🔁 Walk-forward replay (available now)"], horizontal=True, key="fwd_mode",
+                    help="Logged: predictions saved BEFORE kickoff and scored once the result arrives - the only fully leak-free test. "
+                         "Replay: re-predicts the last 30 days of results using only earlier matches; instant, but the half-life and weights were "
+                         "tuned on the same history, so it is a little optimistic.")
+
+    with st.expander("📌 Log predictions for upcoming fixtures (do this before kickoff)", expanded=(mode.startswith("📌") and not log)):
+        st.caption("Saves the raw model's probabilities for every market, so they can be scored once results come in. A fixture already "
+                   "logged keeps its first prediction unless you choose to replace it. Fixtures dated today may already have kicked off: "
+                   "log them earlier. Leagues need their half-life known (open the league once in the Active Projections Matrix tab).")
+        lc1, lc2 = st.columns(2)
+        scope = lc1.radio("Which leagues", ["This league", "All leagues"], horizontal=True, key="fwd_scope")
+        horizon = lc2.slider("Fixtures in the next (days)", 1, 21, 7, key="fwd_horizon")
+        relog = st.checkbox("Replace predictions already logged for fixtures not yet played", value=False, key="fwd_relog")
+        if st.button("📌 Log predictions now", type="primary", key="fwd_log_btn"):
+            today = pd.Timestamp.now().normalize()
+            targets = divisions if scope == "All leagues" else [division]
+            index = {_fwd_key(r): i for i, r in enumerate(log)}
+            added = replaced = kept = 0
+            notes = []
+            prog = st.progress(0.0)
+            for di, div in enumerate(targets):
+                prog.progress((di + 1) / max(len(targets), 1), text=f"{div}")
+                dd = working_df[working_df[division_col] == div]
+                s_d, u_d = E.split_played_unplayed(dd)
+                if u_d.empty or len(s_d) < E.MIN_SAMPLE_ROWS * 2:
+                    continue
+                p = _forward_params(div, s_d, allow_search=(scope == "This league"))
+                if p is None:
+                    notes.append(f"{div}: skipped (no half-life known yet: open it once in the Active Projections Matrix tab)")
+                    continue
+                up = u_d[u_d["date"].notna() & (u_d["date"] >= today) & (u_d["date"] <= today + pd.Timedelta(days=int(horizon)))]
+                for r in up.itertuples():
+                    k = (div, str(pd.Timestamp(r.date).date()), r.home_team, r.away_team)
+                    if k in index and not relog:
+                        kept += 1
+                        continue
+                    pred = E.predict_fixture(
+                        s_d, r.home_team, r.away_team, r.date, half_life_days=p["hl"], weights=p["wts"], engine_weights=p["cfg"]["weights"],
+                        duel_strength=p["cfg"]["duel_strength"], mismatch_table=p["table"], mismatch_strength=p["cfg"]["mismatch_strength"],
+                        use_match_index=p["use_idx"], mc_iterations=4000, ev_mode=ev_mode)
+                    if pred is None:
+                        continue
+                    rec = dict(division=div, fixture_date=k[1], home_team=r.home_team, away_team=r.away_team,
+                               logged_at=pd.Timestamp.now().isoformat(timespec="seconds"), source="batch",
+                               params_note=f"half-life {p['hl']}d, {E.rating_method_signature()}, " + ("calibrated league" if p["calibrated"] else "league not fully calibrated: style factor off"),
+                               probs={m: round(float(v), 4) for m, v in pred["probs"].items()})
+                    if k in index:
+                        log[index[k]] = rec
+                        replaced += 1
+                    else:
+                        index[k] = len(log)
+                        log.append(rec)
+                        added += 1
+            prog.empty()
+            save_forward_log(log)
+            st.session_state["_fwd_log"] = log
+            st.success(f"Logged {added} new prediction(s), replaced {replaced}, kept {kept} existing.")
+            for n in notes:
+                st.caption("• " + n)
+        dc1, dc2 = st.columns(2)
+        dc1.download_button("⬇️ Download the prediction log (.json)", data=json.dumps(log), file_name="sisonke_forward_log.json",
+                            mime="application/json", disabled=not log, key="fwd_dl")
+        up_file = dc2.file_uploader("Restore / merge a saved log", type=["json"], key="fwd_upload", label_visibility="collapsed")
+        if up_file is not None and st.session_state.get("_fwd_last_upload") != up_file.name + str(up_file.size):
+            try:
+                incoming = json.loads(up_file.getvalue().decode("utf-8"))
+                have = {_fwd_key(r) for r in log}
+                new = [r for r in incoming if isinstance(r, dict) and {"division", "fixture_date", "home_team", "away_team", "probs"} <= set(r) and _fwd_key(r) not in have]
+                log.extend(new)
+                save_forward_log(log)
+                st.session_state["_fwd_log"] = log
+                st.session_state["_fwd_last_upload"] = up_file.name + str(up_file.size)
+                st.success(f"Merged {len(new)} prediction(s) from the file.")
+            except Exception as exc:
+                st.error(f"Could not read that file: {exc}")
+        st.caption(f"{len(log)} prediction(s) in the log. On a host with temporary storage the log can be lost when the app restarts: download a copy now and then.")
+
+    if settled_d.empty:
+        st.caption("No settled matches for this league.")
+        return
+    today = pd.Timestamp.now().normalize()
+    if mode.startswith("📌"):
+        window_end = today
+        window_start = today - pd.Timedelta(days=29)
+        recs = [r for r in log if r["division"] == division and window_start <= pd.Timestamp(r["fixture_date"]) <= today + pd.Timedelta(days=30)]
+        scored_all = E.score_logged_predictions(recs, settled_d) if recs else pd.DataFrame()
+        if len(scored_all):
+            fd = pd.to_datetime(scored_all["fixture_date"])
+            scored = scored_all[(fd >= window_start)].reset_index(drop=True)
+        else:
+            scored = scored_all
+        st.caption(f"Window: matches dated {window_start.date()} to {window_end.date()} (the last 30 days up to today).")
+        if scored.empty:
+            st.info("Nothing logged for this league in the window yet. Open the logging panel above, log the upcoming fixtures before kickoff, "
+                    "and come back once they have been played and your data has been updated. Until then, the replay option shows the last 30 days now.")
+            return
+    else:
+        replay_key = (division, len(settled_d), E.rating_method_signature(), ev_mode, backtest_max_evaluated())
+        store = st.session_state.setdefault("_fwd_replay", {})
+        rc1, rc2 = st.columns(2)
+        if rc1.button(f"▶ Compute replay for {division}", key="fwd_replay_btn"):
+            with st.spinner("Re-predicting the last 30 days (earlier matches only)..."):
+                res, why = _fwd_replay(division, settled_d, ev_mode)
+            if res is None:
+                st.warning(why)
+            else:
+                store[replay_key] = res
+        if rc2.button("▶ Compute replay for all leagues (those with a known half-life)", key="fwd_replay_all_btn"):
+            prog = st.progress(0.0)
+            for i, dv in enumerate(divisions):
+                prog.progress((i + 1) / len(divisions), text=dv)
+                s_dv, _u = E.split_played_unplayed(working_df[working_df[division_col] == dv])
+                if len(s_dv) < E.MIN_SAMPLE_ROWS * 2:
+                    continue
+                k2 = (dv, len(s_dv), E.rating_method_signature(), ev_mode, backtest_max_evaluated())
+                if k2 not in store:
+                    res, _ = _fwd_replay(dv, s_dv, ev_mode)
+                    if res is not None:
+                        store[k2] = res
+            prog.empty()
+        scored = store.get(replay_key)
+        last_d = settled_d["date"].max()
+        st.caption(f"Window: the 30 days up to this league's latest result ({last_d.date()}). Each match is predicted only from earlier matches.")
+        if scored is None or scored.empty:
+            st.info("Press “Compute replay” to re-predict this league's last 30 days. It needs the league's half-life to be known already.")
+            return
+
+    # ---- all-league summary (from what exists for this source) ----
+    summary_rows = []
+    if mode.startswith("📌"):
+        for dv in sorted({r["division"] for r in log}):
+            s_dv, _u = E.split_played_unplayed(working_df[working_df[division_col] == dv])
+            rr = [r for r in log if r["division"] == dv and pd.Timestamp(r["fixture_date"]) >= today - pd.Timedelta(days=29)]
+            if rr and not s_dv.empty:
+                summary_rows.append(_fwd_summary_row(dv, E.score_logged_predictions(rr, s_dv), s_dv))
+    else:
+        for (dv, *_rest), sc in store.items():
+            s_dv, _u = E.split_played_unplayed(working_df[working_df[division_col] == dv])
+            if not s_dv.empty:
+                summary_rows.append(_fwd_summary_row(dv, sc, s_dv))
+    if summary_rows:
+        st.markdown("**All leagues**")
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    played = scored[scored["status"] == "played"]
+    pending = scored[scored["status"] == "pending"]
+    res_g = settled_d[["home_goals", "away_goals"]].dropna()
+    clim = ((res_g.home_goals > res_g.away_goals).mean(), (res_g.home_goals == res_g.away_goals).mean(), (res_g.home_goals < res_g.away_goals).mean())
+    s1 = E.forward_1x2_summary(scored, clim)
+    st.markdown(f"**{division}**")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Played", len(played))
+    m2.metric("Awaiting result", len(pending))
+    m3.metric("1X2 top-pick accuracy", "n/a" if not s1.get("n") else f"{s1['top_pick_accuracy'] * 100:.1f}%")
+    m4.metric("1X2 BSS", "n/a" if "bss" not in s1 else f"{s1['bss']:+.3f}")
+    if len(played) < 30:
+        st.caption(f"⚠ Only {len(played)} played matches in the window: a month of one league is a small sample, so these figures can swing by several points by chance alone. Read them as a check, not a verdict.")
+    if mode.startswith("📌") and len(played) and not played["logged_before_match_day"].all():
+        st.warning("Some predictions were logged on the match day itself. Make sure they were saved before kickoff; otherwise they are not a fair forward test.")
+
+    if len(played):
+        rows = []
+        for r in played.sort_values("fixture_date", ascending=False).itertuples():
+            pr, oc = r.probs, r.outcomes
+            top = max([("H", pr.get("Home Win", 0)), ("D", pr.get("Draw", 0)), ("A", pr.get("Away Win", 0))], key=lambda kv: kv[1])[0]
+            actual = "H" if r.home_goals > r.away_goals else ("D" if r.home_goals == r.away_goals else "A")
+            row = {"Date": str(r.fixture_date)[:10], "Match": f"{r.home_team} v {r.away_team}", "Score": f"{r.home_goals}-{r.away_goals}",
+                   "Top pick": f"{ {'H': 'Home', 'D': 'Draw', 'A': 'Away'}[top] }  " + ("✅" if top == actual else "❌")}
+            for m, label in (("Home Win", "Home"), ("Draw", "Draw"), ("Away Win", "Away"), ("Double Chance 12", "12"), ("Over 1.5 Goals", "O1.5"),
+                             ("Over 2.5 Goals", "O2.5"), ("BTTS - Yes", "BTTS Yes"), ("BTTS - No", "BTTS No")):
+                row[label] = _fwd_cell(pr.get(m), oc.get(m))
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=min(560, 60 + 36 * len(rows)))
+        st.caption("Each cell: the model's probability, then ✅ if the strict ≥50% rule was right (the model said yes at 50%+ and it happened, or said no under 50% and it did not), ❌ if wrong.")
+
+        mt = E.forward_market_table(played, FWD_KEY_MARKETS)
+        if len(mt):
+            st.markdown("**Per market (this window)**")
+            st.dataframe(mt, use_container_width=True, hide_index=True)
+        with st.expander("All markets for one match"):
+            labels = [f"{str(r.fixture_date)[:10]}  {r.home_team} v {r.away_team}  ({r.home_goals}-{r.away_goals})" for r in played.itertuples()]
+            pick = st.selectbox("Match", labels, key="fwd_pick_match")
+            r = played.iloc[labels.index(pick)]
+            allm = [{"Market": m, "Model %": round(r.probs[m] * 100, 1),
+                     "Happened": ("void" if r.outcomes.get(m) is None else ("Yes" if r.outcomes[m] else "No")),
+                     "≥50% rule": ("-" if r.outcomes.get(m) is None else ("✅" if ((r.probs[m] >= 0.5) == bool(r.outcomes[m])) else "❌"))}
+                    for m in E.MARKET_LIST if m in r.probs]
+            st.dataframe(pd.DataFrame(allm), use_container_width=True, hide_index=True, height=420)
+    if len(pending):
+        with st.expander(f"Awaiting results ({len(pending)})"):
+            st.dataframe(pd.DataFrame([{"Date": str(r.fixture_date)[:10], "Match": f"{r.home_team} v {r.away_team}",
+                                        "Home %": round(r.probs.get("Home Win", 0) * 100, 1), "Draw %": round(r.probs.get("Draw", 0) * 100, 1),
+                                        "Away %": round(r.probs.get("Away Win", 0) * 100, 1), "Over 2.5 %": round(r.probs.get("Over 2.5 Goals", 0) * 100, 1),
+                                        "BTTS Yes %": round(r.probs.get("BTTS - Yes", 0) * 100, 1), "Logged": str(r.logged_at)[:16]} for r in pending.itertuples()]),
+                         use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Router (Section 1)
+# ---------------------------------------------------------------------------
+if active_tab == "📁 Research & Sentiment Tracker":
+    render_sentiment_tracker()
+else:
+    st.title("⚽ SISONKE FOOTBALL HUB")
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "🔮 Active Projections Matrix", "📊 Live Standings Ledger",
+        "📅 Performance Backtester", "📑 Full Database View",
+        "🌍 Multi-League Bet Slip", "🧪 Forward Test",
+    ])
+    with tab1:
+        render_projections_matrix()
+    with tab2:
+        render_standings_ledger()
+    with tab3:
+        render_backtester()
+    with tab4:
+        render_full_database()
+    with tab5:
+        render_multi_league_slip()
+    with tab6:
+        render_forward_test()
